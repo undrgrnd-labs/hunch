@@ -70,6 +70,8 @@ Run any one from this folder with `uv run <example>/<example>.py`. Times are fro
 | [`question_pilot`](question_pilot/) | Teach the teacher: reword its question from where it's wrong and EG2 is right | pi, InjecAgent, gretel | minutes offline |
 | [`preflight`](preflight/) | Will a question graduate? A check on 150–300 teacher answers | your answers file | 1 min |
 | [`teacher_stream`](teacher_stream/) | Rebuild the stream with your own teacher | pi, a teacher endpoint | ~1 s per item |
+| [`objects`](objects/) | `hunch.live` on a webcam: name what's held up, out loud, and learn new things from you and from Clef | a webcam | live |
+| [`gestures`](gestures/) | `hunch.live` on a webcam: hand signs, faces and one-shot detectors, taught by holding keys | a webcam | live |
 
 ## Results
 

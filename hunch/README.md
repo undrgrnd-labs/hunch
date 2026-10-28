@@ -271,6 +271,37 @@ proxy.wait()                       # until pending refits and background audits 
 
 Custom stores implement `hunch.Store`.
 
+## Live images: `hunch.live`
+
+The proxy answers questions about text states behind a teacher. `hunch.live` answers questions about a stream of
+images, such as a webcam, from one EG2 embedding per frame (about 110 ms on an Apple M5 Pro's CPU at 70 soft tokens), and
+learns from the frames a person or a teacher labels as it runs.
+
+```python
+from hunch.live import Choice, Detector, Eyes, Watcher
+
+eyes = Eyes(tokens=70)
+seen = Choice(eyes, {"nothing": ["a person with empty hands"], "mug": ["a person holding up a mug"]},
+              quiet={"nothing"}, empty="nothing", new=lambda name: [f"a person holding up a {name}"])
+fire = Detector(eyes, yes=["a photo of fire"], no=["a normal indoor photo"], threshold=-0.04)
+
+x, ms = eyes.see(jpeg)
+seen.ask(x)                     # {"name", "p", "state": quiet | sure | unsure, "probs", "zero", ...}
+seen.teach(x, "seashell")       # a new answer, with new("seashell")'s prompts; the student refits in the background
+seen.forget()                   # back to the answers it started with
+watcher = Watcher(seen, teacher)  # teacher(jpeg, names) -> {name or hunch.live.ELSE: probability}
+watcher.look(jpeg, x, seen.ask(x))
+```
+
+- Every answer starts zero-shot from its text prompts. Labelled frames train a logistic regression, which answers as
+  far as a frame resembles the frames it was taught, measured from the `empty` answer's frames.
+- A `Watcher` asks the teacher about the newest frame only when that's worth it, one look at a time, and labels the
+  frames it's sure about.
+- An `Album` keeps labelled frames on disk to teach again after a restart.
+
+[`examples/objects`](../examples/objects/) and [`examples/gestures`](../examples/gestures/) are built on it, and the
+module's docstring has the details.
+
 ## Tests
 
 ```bash

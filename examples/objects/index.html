@@ -159,7 +159,7 @@ function show(out) {
     $("clefWhere").textContent = `$${t.spent.toFixed(4)} spent`;
     $("agree").innerHTML = t.agree === null ? "" : `hunch agrees with Clef on <b>${Math.round(t.agree * 100)}%</b> of its last ${t.checked} sure answers`;
   }
-  const quietThing = out.state === "nothing";
+  const quietThing = out.state === "quiet";
   $("bigEmoji").textContent = quietThing ? "" : out.state === "unsure" ? "🤔" : out.emoji;
   $("bigName").textContent = quietThing ? "" : out.state === "unsure" ? "" : out.name;
 }
@@ -168,7 +168,7 @@ const emojiOf = {};
 function decide(out) {
   if (busy) return;
   if (!out.ready && !teaching) return intro();
-  if (out.state === "known") {
+  if (out.state === "sure") {
     unsure = quiet = 0;
     streak = streak.name === out.name ? { name: out.name, n: streak.n + 1 } : { name: out.name, n: 1 };
     if (streak.n >= STABLE && out.name !== lastSaid && !speaking) {

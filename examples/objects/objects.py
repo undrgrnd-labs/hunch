@@ -1,7 +1,7 @@
-"""A webcam that names what you hold up, out loud, and learns what it doesn't know. EG2 embeds each frame once on the
-CPU; about forty everyday things are known from text prompts alone, and when it's unsure it asks "what's that?",
-listens, and learns the thing from the next two seconds of frames. With --teacher, Clef watches too: a vision model,
-local on the GPU or from OpenRouter, that answers in under a second, labels the frames it's sure about for the
+"""A webcam that names what you hold up, out loud, and learns what it doesn't know: a `hunch.live.Choice` over about
+forty everyday things, known from text prompts alone. When it's unsure it asks "what's that?", listens, and learns
+the thing from the next two seconds of frames. With --teacher, Clef watches too (a `hunch.live.Watcher`): a vision
+model, local on the GPU or from OpenRouter, that answers in under a second, labels the frames it's sure about for the
 student, and says when it sees something that isn't any of the known things.
 
     uv run --with faster-whisper --with kokoro-onnx examples/objects/objects.py   # then open http://localhost:8766
@@ -11,23 +11,16 @@ student, and says when it sees something that isn't any of the known things.
         examples/objects/objects.py --teacher openrouter:cloudflare/clef-flash   # Clef from OpenRouter
     ... --tokens 140                                              # smaller things, about half the frame rate
 
-How it answers:
+How it answers (hunch/src/hunch/live.py has the details):
   empty hands  the first two seconds after start (or holding 0) are labelled "nothing": your face and room, empty
-               handed. A frame's distance from them says whether anything is being shown, and what differs from them
-               says how much a frame resembles a taught thing.
-  zero-shot    every thing has two text prompts ("a person holding up a banana to a webcam"); a frame scores each
-               thing by its similarity to them, standardised across the things, and the nearest wins. "Nothing" and
-               "hand" (a bare hand or a gesture) have prompts too, and are never named out loud.
+               handed. They're the Choice's baseline: a frame's distance from them says whether anything is being
+               shown, and what differs from them says how much a frame resembles a taught thing.
+  zero-shot    every thing has two text prompts ("a person holding up a banana to a webcam"). "Nothing" and "hand"
+               (a bare hand or a gesture) have prompts too, and are quiet: never named out loud.
   taught       saying a thing's name labels the next two seconds of frames with it (a new thing gets prompts and an
-               emoji from its name), and the teacher labels the frames it's sure about. A logistic regression on the
-               labelled frames (standardised, classes weighted equally) decides between the taught things, and it
-               answers as far as the frame resembles the taught frames: what differs from the empty-handed frames is
-               compared with the same for each taught frame. Things never taught keep their zero-shot share.
-  the teacher  Clef looks at the newest frame when something is being shown and the student hasn't just been
-               confirmed on it (and every few seconds otherwise), one look at a time with a rest between, and picks
-               one of the things or "something else". Sure of a thing, it labels that frame for the student; sure of
-               something else, it makes the page ask. It also says how each thing is named out loud: "that's an egg",
-               "those are scissors", "that's rice".
+               emoji from its name), and the teacher labels the frames it's sure about.
+  the teacher  Clef picks one of the things or "something else". Sure of something else, it makes the page ask. It
+               also says how each thing is named out loud: "that's an egg", "those are scissors", "that's rice".
 
 Speech: Kokoro speaks on the CPU (82M parameters, about 0.2 s a line, downloaded once; --voice picks one, and
 "--voice browser" or no kokoro-onnx uses the browser's own voices). What you say is sent here as 16 kHz samples and
@@ -40,7 +33,6 @@ start; "forget" sets the labels aside as labels.<time>.jsonl and goes back to th
 
 import argparse
 import base64
-import collections
 import io
 import json
 import os
@@ -51,19 +43,14 @@ import threading
 import time
 import unicodedata
 import urllib.request
-import zlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import numpy as np
-from sklearn.linear_model import LogisticRegression
-from sklearn.pipeline import make_pipeline
-from sklearn.preprocessing import StandardScaler
 
-from eg2cpu import Model
+from hunch.live import ELSE, Album, Choice, Eyes, Watcher, grey_png
 
 NOTHING, HAND = "nothing", "hand"  # quiet: never named out loud, never asked about
-ELSE = "something else"  # the teacher's answer for a thing that isn't any of the known ones
 KNOWN = {  # thing: emoji, known from text prompts alone
     "banana": "🍌", "apple": "🍎", "orange": "🍊", "lemon": "🍋", "avocado": "🥑", "strawberry": "🍓", "grapes": "🍇",
     "carrot": "🥕", "broccoli": "🥦", "egg": "🥚", "donut": "🍩", "cookie": "🍪", "coffee mug": "☕",
@@ -81,16 +68,7 @@ HAND_PROMPTS = ["an empty hand held up to a webcam", "a person making a hand ges
 TEACHER_SAYS = {NOTHING: "Nothing is held up; just a person or a room",
                 HAND: "A bare hand or a hand gesture, with nothing in it",
                 ELSE: "Something is held up, but none of the other options"}
-TEMPERATURE = 2.5  # on standardised similarities
-SAY = 0.5  # a thing this likely, held steady, is named out loud
-SHOWN = 3.0  # a frame this many empty-handed spreads from the empty-handed frames is showing something
-RESEMBLE, RESEMBLE_SCALE = 0.6, 0.05  # likeness to the taught frames at which the student and the prompts weigh the same
-TEACHER_SURE = 0.5  # the teacher labels a frame (or asks about it) when its answer is this likely
-TEACHER_CAP = 60  # frames the teacher labels per thing; after that it only checks
-TEACHER_FRESH = 1.5  # seconds a teacher's answer stands for the frames after it
-TEACHER_REST = 0.3  # seconds between the teacher's looks, so EG2 has the machine to itself between them
-CONFIRMED = 3.0  # seconds the teacher doesn't look again at a thing it agreed with the student on
-IDLE_LOOK = 3.0  # seconds between the teacher's looks when nothing (or a bare hand) is being shown
+TOP = 5  # things shown on the page, most likely first
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--port", type=int, default=8766)
@@ -100,22 +78,7 @@ ap.add_argument("--teacher", help="Clef, to teach the student as it watches: a l
                                    "(clef-flash-4bit), or openrouter:cloudflare/clef-flash (OPENROUTER_API_KEY)")
 args = ap.parse_args()
 
-model = Model()
-lock = threading.Lock()  # one forward pass at a time; frames queue in the browser, not here
-
-
-def unit(v):
-    v = np.asarray(v, dtype=np.float32)
-    return v / np.linalg.norm(v, axis=-1, keepdims=True)
-
-
-def softmax(z):
-    e = np.exp(z - z.max())
-    return e / e.sum()
-
-
-def sigmoid(z):
-    return 1 / (1 + np.exp(-np.clip(z, -30, 30)))
+eyes = Eyes(tokens=args.tokens)
 
 
 def a_or_an(name):
@@ -127,17 +90,13 @@ PHRASES = {"a": ("That's", "a {}"), "an": ("That's", "an {}"), "plural": ("Those
 
 def naming(name):
     """How to say a thing out loud: Clef's phrasing once it has one, "a" or "an" before that."""
-    kind = teacher.phrases.get(name) if teacher is not None else None
+    kind = clef.phrases.get(name) if clef is not None else None
     verb, noun = PHRASES[kind] if kind else ("That's", a_or_an(name))
     return {"sentence": f"{verb} {noun.format(name)}!", "noun": noun.format(name)}
 
 
 def prompts_for(name):
     return [f"a person holding up {a_or_an(name)} to a webcam", f"a close-up photo of {a_or_an(name)}"]
-
-
-def embed_texts(texts):
-    return unit(np.stack([model.embed(t)[0] for t in texts]))
 
 
 class Emojis:
@@ -151,129 +110,25 @@ class Emojis:
         if cache.exists() and len(np.load(cache)) == len(self.chars):
             self.vectors = np.load(cache)
         else:
-            self.vectors = embed_texts([f"an emoji of {n}" for n in self.names])
+            self.vectors = eyes.read([f"an emoji of {n}" for n in self.names])
             cache.parent.mkdir(exist_ok=True)
             np.save(cache, self.vectors)
+        self.given = {}  # thing: its emoji
 
     def find(self, name):
-        for words in (name, name.rstrip("s")):
-            if words in self.names:
-                return self.chars[self.names.index(words)]
-        return self.chars[int(np.argmax(self.vectors @ embed_texts([f"an emoji of {name}"])[0]))]
+        if name not in self.given:
+            for words in (name, name.rstrip("s")):
+                if words in self.names:
+                    self.given[name] = self.chars[self.names.index(words)]
+                    break
+            else:
+                self.given[name] = self.chars[int(np.argmax(self.vectors @ eyes.read([f"an emoji of {name}"])[0]))]
+        return self.given[name]
 
 
-class Things:
-    """Everything it can name: prompts for each, labelled frames for some. Labels refit the student in the
-    background, so teaching at the frame rate never waits on it."""
-
-    def __init__(self):
-        self.names, self.emoji, self.prompts = [], [], []
-        self.labelled: list[tuple[np.ndarray, int, str]] = []
-        self.student = self.empty = self.residuals = None
-        self.changed = threading.Event()
-        self.adding = threading.Lock()
-        self.add(NOTHING, "🫥", NOTHING_PROMPTS)
-        self.add(HAND, "✋", HAND_PROMPTS)
-        for name, emoji in KNOWN.items():
-            self.add(name, emoji, prompts_for(name))
-        self.known = len(self.names)  # the things known from prompts alone; names taught later come after
-        threading.Thread(target=self.refitting, daemon=True).start()
-
-    def add(self, name, emoji, prompts):
-        self.prompts.append(embed_texts(prompts))
-        self.emoji.append(emoji)
-        self.names.append(name)  # last: a name is only answered once its prompts are in place
-
-    def find(self, name):
-        for n in (name, name + "s", name.rstrip("s"), name.removesuffix("es")):
-            if n in self.names:
-                return self.names.index(n)
-        return None
-
-    def label(self, x, name, by="you"):
-        with self.adding:
-            i = self.find(name)
-            if i is None:
-                self.add(name, emojis.find(name), prompts_for(name))
-                i = len(self.names) - 1
-        self.labelled.append((x, i, by))
-        self.changed.set()
-        return self.names[i]
-
-    def forget(self):
-        """Back to the things known from prompts alone: the taught frames go, and so do the taught names."""
-        with self.adding:
-            self.labelled = []
-            self.student = self.empty = self.residuals = None
-            k = self.known
-            self.names, self.emoji, self.prompts = self.names[:k], self.emoji[:k], self.prompts[:k]
-        self.changed.set()
-
-    def counts(self):
-        out = collections.defaultdict(lambda: {"you": 0, "clef": 0})
-        names = self.names
-        for _, i, by in self.labelled:
-            if i < len(names):
-                out[names[i]][by] += 1
-        return dict(out)
-
-    def refitting(self):
-        while True:
-            self.changed.wait()
-            self.changed.clear()
-            self.refit()
-            time.sleep(0.2)  # labels arriving meanwhile are taken together
-
-    def refit(self):
-        labelled = list(self.labelled)
-        ys = np.array([y for _, y, _ in labelled])
-        X = np.stack([x for x, _, _ in labelled]) if labelled else None
-        student = empty = residuals = None
-        if (ys == 0).sum() >= 2:  # the empty-handed frames: where they sit, and how far apart they spread
-            E = X[ys == 0]
-            centre = E.mean(0)
-            d = np.linalg.norm(E - centre, axis=1)
-            empty = {"centre": centre, "d": float(np.median(d)), "spread": float(d.std() + 1e-4)}
-            residuals = unit(X[ys > 1] - centre) if (ys > 1).any() else None  # things, not nothing or a hand
-        if len(set(ys.tolist())) >= 2:
-            student = make_pipeline(StandardScaler(), LogisticRegression(max_iter=2000, C=0.5, class_weight="balanced"))
-            student.fit(X, ys)
-        self.student, self.empty, self.residuals = student, empty, residuals
-
-    def answer(self, x):
-        names, emoji, prompts = self.names, self.emoji, self.prompts  # forget() swaps these for shorter lists
-        n = min(len(names), len(emoji), len(prompts))
-        student, empty, residuals = self.student, self.empty, self.residuals
-        if student is not None and student.classes_.max() >= n:  # fitted before a forget
-            student = None
-        s = np.array([float((P @ x).mean()) for P in prompts[:n]])
-        p = zero = softmax(TEMPERATURE * (s - s.mean()) / (s.std() + 1e-6))
-        shown, resemble = None, 0.0
-        if empty is not None:
-            shown = (float(np.linalg.norm(x - empty["centre"])) - empty["d"]) / empty["spread"]
-            if residuals is not None:
-                resemble = float(np.max(residuals @ unit(x - empty["centre"])))
-        if student is not None:
-            taught = np.zeros(n)
-            taught[student.classes_] = student.predict_proba(x[None])[0]
-            # the student answers as far as the frame looks like the things it was taught, or like empty hands
-            w = float(sigmoid((resemble - RESEMBLE) / RESEMBLE_SCALE)) if residuals is not None else 0.0
-            if shown is not None:
-                w = max(w, float(sigmoid(2 * (SHOWN - shown))))
-            p = (1 - w) * zero + w * taught
-        best = int(np.argmax(p))
-        if names[best] in (NOTHING, HAND):
-            state = "nothing"
-        elif p[best] >= SAY:
-            state = "known"
-        else:  # no thing stands out: worth asking about only if something is being shown
-            state = "unsure" if shown is None or shown >= SHOWN else "nothing"
-        top = np.argsort(-p)[:5]
-        return {"state": state, "name": names[best], "emoji": emoji[best], "p": round(float(p[best]), 3),
-                "top": [{"name": names[i], "emoji": emoji[i], "p": round(float(p[i]), 3),
-                         "zero": round(float(zero[i]), 3)} for i in top],
-                "shown": None if shown is None else round(shown, 2), "resemble": round(resemble, 3),
-                "labelled": self.counts(), "ready": empty is not None}
+def new_thing(name):
+    emojis.find(name)
+    return prompts_for(name)
 
 
 class LocalClef:
@@ -316,26 +171,24 @@ class OpenRouterClef:
         return {q: a["probabilities"] for q, a in out["answers"].items()}
 
 
-class Teacher:
-    """Clef looks at the newest frame when it's worth it. Sure of a thing, it labels the frame for the student."""
+class Clef:
+    """Clef, asked one question at a time: what a frame shows (the Watcher's teacher), and how to name a thing."""
 
     def __init__(self, where):
         self.clef = OpenRouterClef(where.removeprefix("openrouter:")) if where.startswith("openrouter:") else LocalClef(where)
-        self.newest = None
-        self.wake = threading.Event()
-        self.last = None
-        self.agree = collections.deque(maxlen=50)
-        self.agreed = {}  # thing: when the teacher last agreed with the student on it
-        self.looked = collections.deque(maxlen=200)  # when the teacher looked
-        self.busy = threading.Lock()  # one question to Clef at a time
+        self.busy = threading.Lock()
         self.phrases = json.loads(PHRASED.read_text()) if PHRASED.exists() else {}
-        self.ask(grey_png())  # loads the vision tower before the first frame
-        threading.Thread(target=self.watching, daemon=True).start()
+        self(grey_png(), things.names)  # loads the vision tower before the first frame
         threading.Thread(target=lambda: [self.phrase(n) for n in things.names[2:]], daemon=True).start()
 
     def predict(self, text, questions, image=None):
         with self.busy:
             return self.clef.predict(text, questions, image)
+
+    def __call__(self, image, names):
+        criteria = {n: TEACHER_SAYS.get(n, naming(n)["noun"].capitalize()) for n in names} | {ELSE: TEACHER_SAYS[ELSE]}
+        question = {"type": "choice", "instructions": "What is the person holding up to the camera?", "criteria": criteria}
+        return self.predict("A webcam frame.", {"thing": question}, image)["thing"]
 
     def phrase(self, name):
         if name not in self.phrases:
@@ -347,62 +200,6 @@ class Teacher:
             FRAMES.mkdir(exist_ok=True)
             PHRASED.write_text(json.dumps(self.phrases, indent=0))
         return self.phrases[name]
-
-    def forget(self):
-        self.agree.clear()
-        self.agreed.clear()
-        self.last = None
-
-    def look(self, jpeg, x, student):
-        """Worth a look: a thing the teacher hasn't just agreed with the student on, or now and then otherwise."""
-        now = time.time()
-        if student["state"] == "nothing":  # idle: an occasional look, in case a held thing reads as a bare hand
-            since = now - self.looked[-1] if self.looked else IDLE_LOOK
-            worth = (student["shown"] or 0) >= SHOWN and since >= IDLE_LOOK
-        else:
-            worth = now - self.agreed.get(student["name"], 0) > CONFIRMED
-        if worth:
-            self.newest = (jpeg, x)
-            self.wake.set()
-
-    def ask(self, image):
-        names = things.names[:]
-        criteria = {n: TEACHER_SAYS.get(n, naming(n)["noun"].capitalize()) for n in names} | {ELSE: TEACHER_SAYS[ELSE]}
-        question = {"type": "choice", "instructions": "What is the person holding up to the camera?", "criteria": criteria}
-        return self.predict("A webcam frame.", {"thing": question}, image)["thing"]
-
-    def watching(self):
-        while True:
-            self.wake.wait()
-            self.wake.clear()
-            jpeg, x = self.newest
-            self.looked.append(time.time())
-            t0 = time.perf_counter()
-            out = self.ask(jpeg)
-            ms = (time.perf_counter() - t0) * 1000
-            best = max(out, key=out.get)
-            p = out[best]
-            i = things.find(best) if best != ELSE else None
-            self.last = {"name": best, "emoji": "❓" if i is None else things.emoji[i], "p": round(p, 3),
-                         "ms": round(ms), "at": time.time()}
-            if p >= TEACHER_SURE and i is not None:
-                agreed = things.answer(x)["name"] == best
-                self.agree.append(agreed)
-                if agreed:
-                    self.agreed[best] = time.time()
-                if things.counts().get(best, {}).get("clef", 0) < TEACHER_CAP:
-                    things.label(x, best, by="clef")
-                    save(jpeg, x, best, "clef")
-            time.sleep(TEACHER_REST)
-
-    def describe(self):
-        if self.last is None:
-            return None
-        age = time.time() - self.last["at"]
-        minute = sum(1 for t in self.looked if time.time() - t < 60)
-        return self.last | {"at": None, "age": round(age, 2), "fresh": age < TEACHER_FRESH, "per_minute": minute,
-                            "spent": round(self.clef.spent, 6),
-                            "agree": round(float(np.mean(self.agree)), 3) if self.agree else None, "checked": len(self.agree)}
 
 
 FILLER = re.compile(r"^(?:(?:no|nope|wrong|actually|um+|uh+|so|well|okay|ok|oh|hmm+)\b[,.!]?\s*)*"
@@ -471,6 +268,21 @@ def voice_for(name):
         return None
 
 
+def emoji_of(name):
+    return EMOJI.get(name) or emojis.find(name)
+
+
+def for_page(a):
+    """The Choice's answer for a frame, as the page shows it."""
+    top = sorted(a["probs"], key=a["probs"].get, reverse=True)[:TOP]
+    counts = {n: {"you": c.get("you", 0), "clef": c.get("clef", 0)} for n, c in things.counts().items()}
+    return {"state": a["state"], "name": a["name"], "emoji": emoji_of(a["name"]), "p": round(a["p"], 3),
+            "top": [{"name": n, "emoji": emoji_of(n), "p": round(a["probs"][n], 3), "zero": round(a["zero"][n], 3)}
+                    for n in top],
+            "shown": None if a["shown"] is None else round(a["shown"], 2), "resemble": round(a["resemble"], 3),
+            "labelled": counts, "ready": a["ready"]}
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -492,31 +304,31 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
         if self.path == "/frame":  # JPEG bytes in, the answer out; X-Label: <thing> labels the frame
-            with lock:  # timed inside: the meter shows EG2's time, not the wait for another frame
-                t0 = time.perf_counter()
-                x = unit(model.embed_image(body, max_soft_tokens=args.tokens)[0])
-                ms = (time.perf_counter() - t0) * 1000
+            x, ms = eyes.see(body)
             name = (self.headers.get("X-Label") or "").strip().lower()
             if name:
-                save(body, x, things.label(x, name), "you")
-            out = {"ms": round(ms, 1), "tokens": args.tokens} | things.answer(x)
+                album.keep(body, x, thing=things.teach(x, name), by="you")
+            a = things.ask(x)
+            out = {"ms": round(ms, 1), "tokens": args.tokens} | for_page(a)
             out["say"] = naming(out["name"])["sentence"]
-            if teacher is not None:
-                teacher.look(body, x, out)
-                out["teacher"] = said = teacher.describe()
-                if said and said["fresh"] and said["name"] == ELSE and said["p"] >= TEACHER_SURE and out["state"] != "nothing":
+            if watcher is not None:
+                watcher.look(body, x, a)
+                said = watcher.describe()
+                if said is not None:
+                    out["teacher"] = said | {"emoji": emoji_of(said["name"]) if said["known"] else "❓",
+                                             "spent": round(clef.clef.spent, 6)}
+                if watcher.saw_else() and out["state"] != "quiet":
                     out["state"] = "unsure"  # the teacher sees a thing that isn't any of the known ones
             self.reply(out)
         elif self.path == "/hear":  # speech in (16 kHz mono float32 samples), the words and the thing they name out
             t0 = time.perf_counter()
             text = ears.hear(np.frombuffer(body, dtype=np.float32))
             name = name_from(text)
-            i = things.find(name) if name else None
-            emoji = things.emoji[i] if i is not None else (emojis.find(name) if name else "")
-            name = things.names[i] if i is not None else name
-            if name and teacher is not None:
-                teacher.phrase(name)
-            self.reply({"text": text, "name": name, "emoji": emoji, "known": i is not None,
+            found = things.find(name) if name else None
+            name = found or name
+            if name and clef is not None:
+                clef.phrase(name)
+            self.reply({"text": text, "name": name, "emoji": emoji_of(name) if name else "", "known": found is not None,
                         "noun": naming(name)["noun"] if name else "", "ms": round((time.perf_counter() - t0) * 1000)})
         elif self.path == "/say":  # a line of text in, the voice saying it out (WAV), or 404 for the browser's voices
             if voice is None:
@@ -525,57 +337,34 @@ class Handler(BaseHTTPRequestHandler):
                 self.reply(voice.say(body.decode()), "audio/wav")
         elif self.path == "/forget":
             things.forget()
-            if teacher is not None:
-                teacher.forget()
-            if LABELS.exists():
-                LABELS.rename(FRAMES / f"labels.{int(time.time())}.jsonl")
+            if watcher is not None:
+                watcher.forget()
+            album.set_aside()
             self.reply({})
         else:
             self.send_error(404)
 
 
-def grey_png(side=64):
-    rows = b"".join(b"\0" + b"\x80" * 3 * side for _ in range(side))
-    chunk = lambda kind, data: struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
-    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", side, side, 8, 2, 0, 0, 0))
-            + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
-
-
 FRAMES = Path(__file__).parent / "frames"
-LABELS = FRAMES / "labels.jsonl"
 PHRASED = FRAMES / "phrases.json"  # how Clef said to name each thing, kept across restarts
 
-
-def save(jpeg, x, name, by):
-    FRAMES.mkdir(exist_ok=True)
-    path = FRAMES / f"{time.time_ns()}.jpg"
-    path.write_bytes(jpeg)
-    np.save(path.with_suffix(f".{args.tokens}.npy"), x)
-    with LABELS.open("a") as f:
-        f.write(json.dumps({"file": path.name, "thing": name, "by": by}) + "\n")
-
-
-def saved_embedding(name):
-    cached = (FRAMES / name).with_suffix(f".{args.tokens}.npy")
-    if cached.exists():
-        return np.load(cached)
-    x = unit(model.embed_image((FRAMES / name).read_bytes(), max_soft_tokens=args.tokens)[0])
-    np.save(cached, x)
-    return x
-
-
+EMOJI = {NOTHING: "🫥", HAND: "✋"} | KNOWN
 emojis = Emojis(FRAMES / "emoji-names.npy")
-things = Things()
+things = Choice(eyes, {NOTHING: NOTHING_PROMPTS, HAND: HAND_PROMPTS} | {n: prompts_for(n) for n in KNOWN},
+                quiet={NOTHING, HAND}, empty=NOTHING, new=new_thing)
+album = Album(FRAMES, eyes)
 ears = Ears()
 voice = voice_for(args.voice)
-if LABELS.exists():  # teach again what was taught before the restart
-    rows = [json.loads(line) for line in LABELS.read_text().splitlines()]
-    for r in rows:
-        things.label(saved_embedding(r["file"]), r["thing"], r.get("by", "you"))
-    print(f"taught again from {len(rows)} saved frames", flush=True)
-model.embed_image(grey_png(), max_soft_tokens=args.tokens)  # loads the vision tower before the first frame
-teacher = None  # naming() reads it while Clef loads
-teacher = Teacher(args.teacher) if args.teacher else None
+kept = album.frames()
+for x, row in kept:  # teach again what was taught before the restart
+    things.teach(x, row["thing"], row.get("by", "you"))
+if kept:
+    print(f"taught again from {len(kept)} saved frames", flush=True)
+eyes.warm()
+clef = None  # naming() reads it while Clef loads
+clef = Clef(args.teacher) if args.teacher else None
+watcher = Watcher(things, clef, by="clef", on_label=lambda image, x, name: album.keep(image, x, thing=name, by="clef")) \
+    if clef is not None else None
 print(f"objects: http://localhost:{args.port}  ({args.tokens} soft tokens per frame, {len(things.names)} things"
-      + (", Clef teaching)" if teacher else ")"), flush=True)
+      + (", Clef teaching)" if clef else ")"), flush=True)
 ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
