@@ -24,18 +24,86 @@ export async function load(base = '.', { subgroupMatrix = true, onProgress = nul
   const tFetch0 = performance.now();
   const bin = await fetchBytes(`${base}/weights.bin`, onProgress);
   const tFetch = performance.now() - tFetch0;
-  const W = {};
-  for (const [name, e] of Object.entries(man.tensors)) {
-    const buf = device.createBuffer({ size: Math.ceil(e.nbytes / 4) * 4, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+  const W = {}, temp = [];
+  const usage = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC;
+  const upload = (e) => {
+    const buf = device.createBuffer({ size: Math.ceil(e.nbytes / 4) * 4, usage });
     device.queue.writeBuffer(buf, 0, bin, e.offset, Math.ceil(e.nbytes / 4) * 4);
-    W[name] = buf;
+    return buf;
+  };
+  const enc = device.createCommandEncoder();
+  for (const [name, e] of Object.entries(man.tensors)) {
+    if (name.endsWith('.scale')) continue;
+    if (e.dtype !== 'int8' && e.dtype !== 'fp8') {
+      W[name] = upload(e);
+      continue;
+    }
+    // 8-bit codes and a scale per row, turned into the bf16 matrix the kernels read
+    const [rows, cols] = e.shape;
+    const codes = upload(e), scales = upload(man.tensors[name + '.scale']);
+    const out = device.createBuffer({ size: Math.ceil(rows * cols * 2 / 4) * 4, usage });
+    const pairs = Math.ceil(rows * cols / 2), groups = Math.ceil(pairs / 256);
+    const gx = Math.min(groups, 65535), gy = Math.ceil(groups / gx);
+    const u = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    device.queue.writeBuffer(u, 0, new Uint32Array([rows * cols, cols, gx * 256, 0]));
+    const pipe = dequantPipe(device, e.dtype);
+    const pass = enc.beginComputePass();
+    pass.setPipeline(pipe);
+    pass.setBindGroup(0, device.createBindGroup({ layout: pipe.getBindGroupLayout(0), entries: [codes, scales, out, u].map(
+      (buffer, binding) => ({ binding, resource: { buffer } })) }));
+    pass.dispatchWorkgroups(gx, gy);
+    pass.end();
+    temp.push(codes, scales, u);
+    W[name] = out;
   }
+  device.queue.submit([enc.finish()]);
   const special = new Float32Array(bin, man.tensors['t.special'].offset, 4 * 512);
   const m = new Model(device, adapter, man, W, special.slice());
   m.useSG = subgroupMatrix && device.features.has('chromium-experimental-subgroup-matrix');
   await device.queue.onSubmittedWorkDone();
+  for (const b of temp) b.destroy();
+  m.format = man.format || 'bf16';
   m.loadMs = { total: performance.now() - t0, fetch: tFetch };
   return m;
+}
+
+// 8-bit codes (four to a u32) and an f32 scale per row in; bf16 pairs (two to a u32, rounded to nearest even) out.
+const dequantPipes = new Map();
+function dequantPipe(device, format) {
+  if (!dequantPipes.has(device)) dequantPipes.set(device, {});
+  const cache = dequantPipes.get(device);
+  if (cache[format]) return cache[format];
+  const decode = format === 'int8'
+    ? `fn decode(b: u32) -> f32 { return f32(bitcast<i32>(b << 24u) >> 24u); }`
+    : `fn decode(b: u32) -> f32 {  // fp8 e4m3
+         let e = (b >> 3u) & 15u; let m = f32(b & 7u);
+         let v = select(ldexp(1.0 + m / 8.0, i32(e) - 7), ldexp(m / 8.0, -6), e == 0u);
+         return select(v, -v, (b & 0x80u) != 0u);
+       }`;
+  const code = `
+@group(0) @binding(0) var<storage, read> codes: array<u32>;
+@group(0) @binding(1) var<storage, read> scales: array<f32>;
+@group(0) @binding(2) var<storage, read_write> out: array<u32>;
+struct U { n: u32, cols: u32, stride: u32, pad: u32 }
+@group(0) @binding(3) var<uniform> u: U;
+${decode}
+fn value(i: u32) -> f32 {
+  if (i >= u.n) { return 0.0; }
+  let b = (codes[i >> 2u] >> ((i & 3u) * 8u)) & 0xffu;
+  return decode(b) * scales[i / u.cols];
+}
+fn bf16(x: f32) -> u32 {
+  let b = bitcast<u32>(x);
+  return (b + 0x7fffu + ((b >> 16u) & 1u)) >> 16u;
+}
+@compute @workgroup_size(256)
+fn main(@builtin(global_invocation_id) g: vec3<u32>) {
+  let p = g.x + g.y * u.stride;
+  if (p * 2u >= u.n) { return; }
+  out[p] = bf16(value(p * 2u)) | (bf16(value(p * 2u + 1u)) << 16u);
+}`;
+  cache[format] = device.createComputePipeline({ layout: 'auto', compute: { module: device.createShaderModule({ code }), entryPoint: 'main' } });
+  return cache[format];
 }
 
 const f32bits = (x) => new Uint32Array(new Float32Array([x]).buffer)[0];
