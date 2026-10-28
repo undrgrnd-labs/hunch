@@ -25,6 +25,11 @@ and `failure_severity` read. **Time:** about 3 minutes.
 
 ## Findings
 
+A *readout* is which layer the decision reads and how it turns contrasts into a direction (LDA, or diff of means); the
+spec's row is the decision as compiled. *Escalated* is the share of the 580 results it was unsure of and would send
+to the teacher; *accuracy when answered* is over the rest. *Abstains on tau2* is the share of 200 customer-support
+tool outputs it refuses as unlike its contrasts: there, higher is better, since the decision wasn't built for them.
+
 | readout | AUC | accuracy | accuracy when answered | escalated | abstains on tau2 |
 |---|---|---|---|---|---|
 | spec: final layer, LDA (auto) | 0.902 | 0.822 | 0.881 | 21% | 1% |
@@ -44,6 +49,11 @@ results):
 | teacher, calibrated on 200 labels | 0.888 [0.862, 0.912] | 0.851 | 0.36 | 0.171 | 0.033 |
 | EG2 + 200 labels | 0.962 [0.947, 0.978] | 0.955 | 0.60 | 0.070 | 0.014 |
 | teacher + EG2, combined on 200 labels | 0.964 [0.948, 0.979] | 0.972 | 0.52 | 0.052 | 0.014 |
+
+The rows follow the columns of the [examples' results](../README.md#results): the compiled decision, the zero-shot
+teacher, the teacher with its cut points tuned on 200 labelled results, a student on EG2 features trained on those
+200 (its column there is "EG2, 200 labels †"), and a combination of the two. Brier and ECE measure whether the
+stated probabilities match how often the answers are right (lower is better; see the [glossary](../../docs/glossary.md#metrics-and-intervals)).
 
 - The decision and the zero-shot teacher are level: +0.021 [−0.017, +0.059]. The cascade (EG2 where it answers,
   the teacher where it escalates or abstains) scores 0.852 with EG2 answering 78% of results.

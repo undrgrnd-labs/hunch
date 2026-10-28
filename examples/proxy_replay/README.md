@@ -20,9 +20,11 @@ minutes, plus 3 for `tool_call_failed`.
 
 ## What it does
 
-- Questions: `tool_failed` (yes/no), `output_kind` (7 options) and `severity` (4 levels).
-- Each question's student learns only from the items it sent to the teacher: a warm-up, the forwarded items and
-  the audits.
+- Questions: `tool_failed` (yes/no), `output_kind` (7 options) and `severity` (4 levels); the [examples
+  README](../README.md#reading-the-examples) lists their answers. A request asks all three about one tool result, the
+  way the teacher reads them: once, for every question.
+- Each question's student learns only from the items it sent to the teacher: a warm-up (the first 150 items, all
+  forwarded), the forwarded items and the audits. Students refit every 100 items.
 - A student graduates when its cross-validated agreement with the teacher and its recall on the teacher's less common
   answers both clear their bars. The agreement bar is the *target*, 0.90 by default.
 - A request is answered locally only if every question is confident and the state isn't novel; 10% of local answers
@@ -40,9 +42,11 @@ training items' statistics, so the replay uses nothing about items it hasn't rea
   `severity` never graduates.
 - With `tool_failed` routed one-sided (only a confident "not failed" is answered locally), `tool_failed` and
   `output_kind` together are answered locally for 72% of the second half's requests, and compute is 213 ms per item
-  against 494 for the teacher alone (eg2cpu measured at 31 ms per item here). `tool_failed`'s local answers are all
-  "no", so their agreement (0.994) equals the always-"no" baseline; 4 of the teacher's 61 "failed" answers in the
-  second half were answered "no" locally.
+  against 494 for the teacher alone: 31 ms of eg2cpu per item (measured here), plus the teacher's 494 ms times the
+  teacher calls per item. `tool_failed`'s local answers are all "no", so their agreement (0.994) equals the
+  always-"no" baseline. The cost of one-sided routing is the failures it misses: 4 of the teacher's 61 "failed"
+  answers in the second half were answered "no" locally, a 7% miss rate on failures, which audits would catch over
+  time but not per item.
 
 `proxy_service` reports different local shares on the same stream: it sends one request per question, so a question
 that never graduates doesn't hold the others back, and it answers repeated states from the store.

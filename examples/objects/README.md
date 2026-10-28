@@ -7,6 +7,28 @@ student's answers until each thing graduates.
 
 ![the objects demo naming an orange held up to a webcam, with Clef teaching](../../docs/demo/objects.png)
 
+## How it works
+
+It is the proxy's loop on a camera: a student answers every frame, a teacher checks it, and an answer is trusted
+once it graduates. In `hunch.live`'s terms ([hunch's README](../../hunch/README.md#live-images-hunchlive)):
+- **Every frame** is embedded once by EG2's image path (about 110 ms on an Apple M5 Pro's CPU, at 70 *soft tokens*:
+  the number of image tokens the frame becomes; more see smaller things, more slowly).
+- **The answers** are a `Choice`: each thing has two text prompts ("a person holding up a banana to a webcam"), so it
+  can be named before anyone teaches it, by how close the frame's embedding is to the prompts'. "Nothing" and "hand"
+  are answers too, but quiet: never said out loud.
+- **Empty hands first:** the first two seconds are labelled "nothing". Those frames are the baseline: how far a frame
+  is from them says whether something is being shown, and what differs from them says how much it looks like a
+  taught thing.
+- **Teaching:** naming a thing labels the next two seconds of frames (about 15) with it; a new name becomes a new
+  answer with its own prompts and emoji. A logistic regression on the labelled frames (the student) refits in the
+  background, and answers as far as a frame resembles the frames it was taught.
+- **The teacher** is a `Watcher`: Clef looks at a frame when that's worth it and labels the frames it's sure about.
+- **Graduation:** each of Clef's looks checks the student's answer, if that answer was steady (the same for three
+  frames in a row). A thing graduates once the 95% lower bound of its agreement with Clef reaches 0.90 over at least
+  20 checks, which takes about 35 checks with no disagreement; it is demoted while the upper bound is below 0.90.
+  Until then it says "I think that's a lemon"; after, "That's a lemon!". The bar under its name is the share of the
+  checks it needs that it has.
+
 From `examples/`, after the [setup](../README.md#setup):
 
 ```bash
@@ -34,6 +56,9 @@ To check the server works, send it any image; it answers with the thing it sees:
 ```bash
 curl -s --data-binary @../docs/demo/objects.png localhost:8766/frame
 ```
+
+The README's screenshot holds an orange, so the answer starts `{"ms": 124.1, "tokens": 70, "state": "sure",
+"name": "orange", "emoji": "🍊", "p": 0.991, ...}`, followed by the top five answers and what it would say.
 
 ## A teacher
 

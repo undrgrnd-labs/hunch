@@ -49,7 +49,7 @@ instead of trying to answer something it isn't capable of.
 
 ## Ok, I'm hooked!
 
-hunch is built on top of EmbeddingGemma2 - a model that takes multimodal input (text, images, audio) and spits out a
+hunch is built on top of EmbeddingGemma 2 (EG2) - a model that takes multimodal input (text, images, audio) and spits out a
 giant vector representing semantic concepts from that input.
 
 Before we tell you more about hunch, some useful things to know:
@@ -59,8 +59,20 @@ Before we tell you more about hunch, some useful things to know:
   of yes.
 - **Teacher:** the model you would otherwise call for every question, such as a decision model (Clef, Jev, etc) or an LLM-as-judge (frontier model or otherwise).
 - **Student:** hunch's small classifier for one question, which reads an embedding of the state from EmbeddingGemma 2.
+- **State:** what a question is asked about: a tool call and its output, a message, or any JSON (an image, in
+  `hunch.live`).
+- **Graduation:** the point where a question's student starts answering on its own: cross-validation on the
+  teacher's answers shows it agrees with the teacher often enough. Until then, every request goes to the teacher. A
+  yes/no question can graduate *one-sided*, where only a confident "no" is answered locally.
+- **Audit:** after graduation, 10% of the student's answers also go to the teacher. A student whose audits stop
+  agreeing is demoted, and the teacher answers again until it recovers.
+- **Compiled decision:** eg2cpu's way to answer one question with no teacher at all: a small file (`.eg2h`, a
+  *handle*) built from contrasting examples (texts that differ only in the answer, written by hand or picked from
+  labelled data) and about 60 labelled rows that calibrate its probabilities. When it's unsure it *escalates* (to the teacher), and on input unlike anything it was built from it
+  *abstains*. Several examples test these.
 
-hunch trains the student on the teacher's judgements and then takes over once it is confident enough.
+hunch trains the student on the teacher's judgements and then takes over once it is confident enough. Every term in the
+docs, with its formula, is in the [glossary](docs/glossary.md).
 
 ## Why
 

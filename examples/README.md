@@ -6,6 +6,56 @@ question zero-shot. The teacher here is Clef (Clef-Flash, a 9B model run locally
 an Apple-silicon laptop); its decoding settings were not recorded with its answers. The teacher's answers ship with
 each example, keyed by hashes, so every comparison replays without running it.
 
+## Reading the examples
+
+Terms are defined in the front page's [list of useful things](../README.md#ok-im-hooked) and, with formulas, in the
+[glossary](../docs/glossary.md). What else you need:
+
+**The data.**
+- *pi*: real sessions of the pi coding agent: each tool call it made (`bash`, `read`, `edit`...) and the output it
+  got back, with the agent harness's own error flag (`isError`).
+- *tau2*: customer-support agents' tool calls (tau2-bench), used where an example needs a domain it wasn't built for.
+- *InjecAgent*: tool responses with an attacker's instruction planted in one field, for prompt injection.
+- *gretel*: synthetic finance documents with their personal data marked, for PII.
+- *SST-5*: movie-review sentences rated on five levels of sentiment.
+
+**The stream.** The proxy examples use 2,000 pi tool results in time order (1,880 distinct: some outputs repeat), each
+answered by the teacher on three questions:
+
+| question | type | answers |
+|---|---|---|
+| `tool_failed` | yes/no | did the tool call itself fail (an error or a refusal)? A tool that ran and reported bad news did not |
+| `output_kind` | choice | source, test run, build, search, version control, edit, other |
+| `severity` | score (ordered levels) | none, minor, recoverable (the agent can fix it), blocking (it can't: credentials, permissions, outages) |
+
+**Four kinds of model read EG2's embeddings here, and the examples name them differently:**
+- **the proxy's student** (`proxy_service`, `proxy_replay`, `proxy_early_exit`): learns each question from the
+  teacher's answers as requests arrive, and answers only once it graduates. Its numbers are agreement with the
+  teacher, not accuracy.
+- **a compiled decision** (the **EG2** column below): built from a spec's contrasts and 60 labelled rows, with no
+  teacher.
+- **a student on 200 labels** (the **EG2, 200 labels †** column): a logistic regression on EG2 features, trained on
+  labelled rows from the test set's own distribution.
+- **a probe** (`pii`, `layer_auto`): a linear model fitted on one layer's embeddings, to ask *whether* the
+  information is there and at which layer.
+
+In the comparisons the teacher is a zero-shot baseline: nothing is learned from it there. In the proxy examples it's
+the model the student learns from.
+
+**What the times measure.** They differ because they time different things, all on CPUs:
+- about 0.6 ms: eg2cpu encoding a short text to layer 8, in batches, on a 24-core server;
+- 22 ms (p50): one hunch request answered by the student, end to end over HTTP, for a 190-token tool result on an
+  Apple M5 Pro;
+- 31 ms per item: eg2cpu's full pass over the stream's tool results (most longer than 190 tokens), batched across
+  all cores and averaged, in `proxy_replay`;
+- 35–49 ms: one compiled decision on one item, one at a time on an Apple M5 Pro: encoding to the decision's layer,
+  then its direction, calibration and abstain check, as the `pii` and `prompt_injection` GIFs show (a decision read
+  at a later layer, like injection's layer 20 against PII's 8, takes longer);
+- about 500 ms: the teacher (Clef) on one item.
+
+**The live demos** (`objects`, `gestures`, `browser`) have no dataset and no recorded teacher answers, and aren't in
+the results below: they show `hunch.live` and EG2's image path working, rather than measuring them.
+
 ## Setup
 
 You need a Rust toolchain (1.88 or later), because `uv sync` builds eg2cpu from `../eg2cpu` (about a minute the first
@@ -134,7 +184,7 @@ On the clean set a positive difference means more false alarms.
   truth is the harness flag, which labels teach directly) and injection on unseen tools. It is level on 4 (both
   severity sets, enhanced wording, seen-tool injections) and behind on 3: SST-5 (sentiment intensity is barely in the
   embedding), gretel PII, and the clean pi outputs, where a student fitted on InjecAgent's formats flags 47% of real
-  tool results. EG2 answers in about 1 ms on a CPU instead of a model call.
+  tool results. EG2 answers in tens of milliseconds on a CPU, against about 500 ms for the teacher.
 - **Combining both beats the tuned teacher on 1 of the 9 (tool failure)** and is level on 6; it is behind on SST-5
   (by 0.011) and on the clean set.
 - **QWK and F1 disagree on severity.** On the stream, the † student and the tuned teacher are level on QWK, but the

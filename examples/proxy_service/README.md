@@ -25,7 +25,8 @@ The stream's three questions (`hunch_examples.STREAM_QUESTIONS`):
 ## What it does
 
 1. Starts a proxy on a free port (`hunch.serve`), backed by an `OfflineBackend` over the recorded answers in
-   [`../data/teacher_stream.jsonl`](../data/teacher_stream.jsonl).
+   [`../data/teacher_stream.jsonl`](../data/teacher_stream.jsonl). The students read layer 8, 10% of local answers
+   are audited, and a student refits after every 100 new examples (the proxy's defaults).
 2. Trains `tool_failed` through `POST /v1/train` on the first 150 results, labelled with the agent harness's own error
    flag. The recorded teacher calls 20% of flagged errors "not failed"; labelled cases are how hunch learns past a
    teacher's blind spot.
@@ -36,10 +37,22 @@ The stream's three questions (`hunch_examples.STREAM_QUESTIONS`):
 
 ## Findings
 
-Over the last 500 results (each a request per question). "Student" counts only answers that made no teacher call:
-an audited answer did call the teacher, and a store hit reuses an answer the teacher gave before. Agreement is
-measured on the student's answers in the same 500, beside what always giving the teacher's most common answer would
-score on them:
+Over the last 500 results (each a request per question). Every request ends up in one of four columns, which add up
+to 100%:
+- **student, no teacher call:** the question has graduated, its student is confident and the state isn't novel, so it
+  answered alone. A question graduates when its student's cross-validated answers agree with the teacher's with a
+  95% lower bound of at least 0.90 (and catch the teacher's less common answers too); one-sided, when the student's
+  confident "no"s miss at most 2% of the teacher's "yes"es. A state is novel when it's further from everything the
+  student has seen than its examples are from each other. The [glossary](../../docs/glossary.md#the-proxy-hunch) has
+  each rule in full;
+- **audited:** the student answered, and the request was one of the 10% also sent to the teacher to check it;
+- **from the store:** the same state was answered before (the stream repeats some outputs), so the answer the proxy
+  kept for it, the teacher's or a label, is reused;
+- **forwarded:** the question hasn't graduated, or its student was unsure or the state novel, so the teacher answered.
+
+Teacher calls per request are the audited and forwarded shares together. Over the whole run, the proxy called the
+teacher 3,402 times for 5,550 question-requests (the seed's 150 labels need no teacher). Agreement is measured on the student's
+answers in the same 500, beside what always giving the teacher's most common answer would score on them:
 
 | question | student, no teacher call | audited | from the store | forwarded | teacher calls per request | student agreement with the teacher | always the most common answer |
 |---|---|---|---|---|---|---|---|
@@ -50,8 +63,11 @@ score on them:
 - `output_kind` agrees with the teacher far above its baseline.
 - `tool_failed` graduates one-sided: the student answers only a confident "not failed" and forwards the rest, so
   its local answers are all "no", and their agreement equals the always-"no" baseline. What it saves is teacher
-  calls; whether it misses failures shows in the audits (84 audits, no misses over the run) and in `proxy_replay`.
-- `severity` never graduates; the 6% of its requests about a state seen before are answered from the store.
+  calls; whether it misses failures shows in the audits: of 84 audits over the run, none was a local "no" the teacher
+  called "failed". `proxy_replay` measures the misses on the whole stream.
+- `severity` never graduates: whether a failure is recoverable often depends on context outside the tool result
+  ([question design](../../docs/question-design.md) has why). The 6% of its requests about a state seen before are
+  answered from the store.
 
 Agreement is with the teacher, not with ground truth. `proxy_replay` replays the same stream with its own copy of the
 policy, all at once rather than one request per question, so its shares differ.
