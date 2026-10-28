@@ -302,6 +302,24 @@ watcher.look(jpeg, x, seen.ask(x))
 [`examples/objects`](../examples/objects/) and [`examples/gestures`](../examples/gestures/) are built on it, and the
 module's docstring has the details.
 
+### In the browser
+
+[`web/live.ts`](web/live.ts) is the same `Choice`, `Detector` and `Watcher` in TypeScript, with `Eyes` running EG2's
+image path on the GPU through WebGPU ([`web/eg2/`](web/eg2/), about 60 ms a frame on an Apple M5 Pro in Chrome). The
+browser runs no text path, so prompts arrive as vectors embedded beforehand with eg2cpu. `web/dist/live.js` is the
+bundle; `npm run build` in `web/` makes it again, and `npm run check` type-checks.
+
+```js
+import { Choice, Eyes } from './hunch/web/dist/live.js';
+
+const eyes = await Eyes.open({ weights: 'weights', tokens: 70 });   // examples/browser/convert.py writes the weights
+const things = new Choice({ nothing: nothingVector, mug: mugVector }, { quiet: ['nothing'], empty: 'nothing' });
+const { x, ms } = await eyes.see(video);
+things.ask(x); things.teach(x, 'seashell'); things.forget();
+```
+
+[`examples/browser`](../examples/browser/) is built on it.
+
 ## Tests
 
 ```bash

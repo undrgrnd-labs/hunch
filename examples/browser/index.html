@@ -87,153 +87,27 @@
   </aside>
 </main>
 <script type="module">
-import { load, targetSize, resize } from './model.js';
+import { Choice, Eyes } from '../../hunch/web/dist/live.js';
 
 const $ = id => document.getElementById(id);
-const TEMPERATURE = 2.5;  // on standardised similarities
-const SAY = 0.5;          // a thing this likely, held steady, is named out loud
-const SHOWN = 3.0;        // this many empty-handed spreads from the empty-handed frames is showing something
-const RESEMBLE = 0.6, RESEMBLE_SCALE = 0.05;  // likeness to taught frames at which student and prompts weigh the same
-const TEACH_MS = 2000, STABLE = 3, ASK_AFTER = 8, ASK_EVERY = 10000, PER_THING = 60;
-const QUIET = new Set(["nothing", "hand"]);
+const TEACH_MS = 2000, STABLE = 3, ASK_AFTER = 8, ASK_EVERY = 10000;
 
-let model, things = [], phrases = {}, labelled = [], empty = null, residuals = [], student = null;
+let eyes, things, emoji = {}, phrases = {};
 let teaching = null, held0 = false, muted = false, frames = 0, stamps = [];
 let lastSaid = null, streak = { name: null, n: 0 }, unsure = 0, quiet = 0, lastAsk = 0, speaking = false;
 
-// ---- vectors
-const dot = (a, b) => { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; };
-const unit = v => { const n = Math.hypot(...v) || 1; return v.map(x => x / n); };
-const sub = (a, b) => a.map((x, i) => x - b[i]);
-const sigmoid = z => 1 / (1 + Math.exp(-Math.max(-30, Math.min(30, z))));
-function softmax(z) { const m = Math.max(...z), e = z.map(v => Math.exp(v - m)), s = e.reduce((a, b) => a + b, 0); return e.map(v => v / s); }
-
-// ---- the student: a logistic regression on standardised embeddings, classes weighted equally, fitted in a worker
-const trainer = new Worker(URL.createObjectURL(new Blob([`
-onmessage = ({ data: { X, y, k } }) => {
-  const n = X.length, d = X[0].length, C = 0.5;
-  const mean = new Float64Array(d), sd = new Float64Array(d);
-  for (const x of X) for (let j = 0; j < d; j++) mean[j] += x[j] / n;
-  for (const x of X) for (let j = 0; j < d; j++) sd[j] += (x[j] - mean[j]) ** 2 / n;
-  for (let j = 0; j < d; j++) sd[j] = Math.sqrt(sd[j]) || 1;
-  const Z = X.map(x => Float64Array.from(x, (v, j) => (v - mean[j]) / sd[j]));
-  const count = new Float64Array(k); for (const c of y) count[c]++;
-  const cw = Array.from(count, c => c ? n / (k * c) : 0);
-  const W = Array.from({ length: k }, () => new Float64Array(d)), b = new Float64Array(k);
-  const mW = W.map(() => new Float64Array(d)), vW = W.map(() => new Float64Array(d)), mb = new Float64Array(k), vb = new Float64Array(k);
-  for (let it = 1; it <= 150; it++) {
-    const gW = W.map(() => new Float64Array(d)), gb = new Float64Array(k);
-    for (let i = 0; i < n; i++) {
-      const z = W.map((w, c) => { let s = b[c]; for (let j = 0; j < d; j++) s += w[j] * Z[i][j]; return s; });
-      const m = Math.max(...z), e = z.map(v => Math.exp(v - m)), t = e.reduce((a, v) => a + v, 0);
-      for (let c = 0; c < k; c++) {
-        const g = cw[y[i]] * (e[c] / t - (c === y[i] ? 1 : 0));
-        gb[c] += g; const gw = gW[c], zi = Z[i];
-        for (let j = 0; j < d; j++) gw[j] += g * zi[j];
-      }
-    }
-    for (let c = 0; c < k; c++) {  // Adam on C * loss + |W|^2 / 2, sklearn's objective
-      for (let j = 0; j < d; j++) {
-        const g = C * gW[c][j] + W[c][j];
-        mW[c][j] = 0.9 * mW[c][j] + 0.1 * g; vW[c][j] = 0.999 * vW[c][j] + 0.001 * g * g;
-        W[c][j] -= 0.02 * (mW[c][j] / (1 - 0.9 ** it)) / (Math.sqrt(vW[c][j] / (1 - 0.999 ** it)) + 1e-8);
-      }
-      const g = C * gb[c];
-      mb[c] = 0.9 * mb[c] + 0.1 * g; vb[c] = 0.999 * vb[c] + 0.001 * g * g;
-      b[c] -= 0.02 * (mb[c] / (1 - 0.9 ** it)) / (Math.sqrt(vb[c] / (1 - 0.999 ** it)) + 1e-8);
-    }
-  }
-  postMessage({ mean, sd, W, b });
-};`], { type: "text/javascript" })));
-let fitting = false, refitWanted = false, generation = 0;  // generation: forgetting drops fits already under way
-function refit() {
-  refitWanted = false;
-  const ys = labelled.map(l => l.i);
-  const e = labelled.filter(l => l.i === 0).map(l => l.x);
-  if (e.length >= 2) {  // the empty-handed frames: where they sit, and how far apart they spread
-    const centre = e[0].map((_, j) => e.reduce((a, x) => a + x[j], 0) / e.length);
-    const d = e.map(x => Math.hypot(...sub(x, centre))).sort((a, b) => a - b);
-    const mean = d.reduce((a, v) => a + v, 0) / d.length;
-    empty = { centre, d: d[d.length >> 1], spread: Math.sqrt(d.reduce((a, v) => a + (v - mean) ** 2, 0) / d.length) + 1e-4 };
-    residuals = labelled.filter(l => l.i > 1).map(l => unit(sub(l.x, centre)));
-  } else { empty = null; residuals = []; }
-  const classes = [...new Set(ys)].sort((a, b) => a - b);
-  if (classes.length < 2) { student = null; return; }
-  if (fitting) { refitWanted = true; return; }
-  fitting = true;
-  const keep = classes.flatMap(c => labelled.filter(l => l.i === c).slice(-PER_THING));
-  const asked = generation;
-  trainer.onmessage = ({ data: fit }) => {
-    fitting = false;
-    if (asked === generation) student = { ...fit, classes };
-    if (refitWanted) refit();
-  };
-  trainer.postMessage({ X: keep.map(l => l.x), y: keep.map(l => classes.indexOf(l.i)), k: classes.length });
-}
-function predict(x) {
-  const z = student.W.map((w, c) => { let s = student.b[c]; for (let j = 0; j < x.length; j++) s += w[j] * (x[j] - student.mean[j]) / student.sd[j]; return s; });
-  return softmax(z);
-}
-
-// ---- what a frame shows
-function answer(x) {
-  const n = things.length, prompted = things.map(t => !!t.prompt);
-  const s = things.map(t => t.prompt ? dot(t.prompt, x) : 0).filter((_, i) => prompted[i]);
-  const mu = s.reduce((a, v) => a + v, 0) / s.length, sd = Math.sqrt(s.reduce((a, v) => a + (v - mu) ** 2, 0) / s.length) + 1e-6;
-  const zs = softmax(s.map(v => TEMPERATURE * (v - mu) / sd));
-  let k = 0;
-  const zero = prompted.map(p => p ? zs[k++] : 0);
-  let p = zero, shown = null, resemble = 0;
-  if (empty) {
-    const r = sub(x, empty.centre);
-    shown = (Math.hypot(...r) - empty.d) / empty.spread;
-    const ru = unit(r);
-    for (const q of residuals) resemble = Math.max(resemble, dot(q, ru));
-  }
-  if (student) {  // the student answers as far as the frame looks like what it was taught, or like empty hands
-    const taught = new Array(n).fill(0);
-    predict(x).forEach((v, c) => taught[student.classes[c]] = v);
-    let w = residuals.length ? sigmoid((resemble - RESEMBLE) / RESEMBLE_SCALE) : 0;
-    if (shown !== null) w = Math.max(w, sigmoid(2 * (SHOWN - shown)));
-    p = zero.map((z, i) => (1 - w) * z + w * taught[i]);
-  }
-  const order = p.map((v, i) => i).sort((a, b) => p[b] - p[a]);
-  const best = order[0], name = things[best].name;
-  const state = QUIET.has(name) ? "nothing" : p[best] >= SAY ? "known" : shown === null || shown >= SHOWN ? "unsure" : "nothing";
-  return { state, best, p, zero, order, shown };
-}
-
 // ---- the loop: one frame in flight, embedded on the GPU
-const canvas = document.createElement("canvas");
-canvas.width = canvas.height = 384;
-const ctx = canvas.getContext("2d", { willReadFrequently: true });
-const [TH, TW] = targetSize(384, 384, 70 * 9);
-
 async function loop() {
-  const v = $("video"), side = Math.min(v.videoWidth, v.videoHeight);
-  ctx.drawImage(v, (v.videoWidth - side) / 2, (v.videoHeight - side) / 2, side, side, 0, 0, 384, 384);
-  const px = ctx.getImageData(0, 0, 384, 384).data, rgb = new Uint8Array(384 * 384 * 3);
-  for (let i = 0, j = 0; i < px.length; i += 4, j += 3) { rgb[j] = px[i]; rgb[j + 1] = px[i + 1]; rgb[j + 2] = px[i + 2]; }
-  const small = resize(rgb, 384, 384, TH, TW);
-  const t0 = performance.now();
-  const x = Array.from(await model.embedRgb(small, TH, TW));
-  const ms = performance.now() - t0;
-  if (held0) learn(x, "nothing", "");
-  else if (teaching && performance.now() < teaching.until) learn(x, teaching.name, teaching.emoji);
-  const out = answer(x);
+  const { x, ms } = await eyes.see($("video"));
+  if (held0) things.teach(x, "nothing");
+  else if (teaching && performance.now() < teaching.until) {
+    things.teach(x, teaching.name);
+    emoji[teaching.name] ??= teaching.emoji || "⭐";
+  }
+  const out = things.ask(x);
   show(out, ms);
   decide(out);
   requestAnimationFrame(loop);
-}
-
-function learn(x, name, emoji) {
-  let i = things.findIndex(t => t.name === name);
-  if (i < 0) {
-    things.push({ name, emoji: emoji || "⭐", prompt: null });
-    i = things.length - 1;
-  }
-  labelled.push({ x, i });
-  refit();
 }
 
 function show(out, ms) {
@@ -244,16 +118,15 @@ function show(out, ms) {
   $("fps").textContent = (stamps.length / 2).toFixed(1);
   $("ms").textContent = ms.toFixed(0);
   $("frames").textContent = frames;
-  $("rows").innerHTML = out.order.slice(0, 5).map((i, r) => `
-    <div class="row${r === 0 ? " top" : ""}"><span class="emoji">${things[i].emoji}</span>
-      <div class="track"><div class="fill" style="width:${out.p[i] * 100}%"></div>${things[i].prompt ? `<div class="zero" style="left:${out.zero[i] * 100}%"></div>` : ""}
-        <span class="label">${things[i].name}</span></div><span class="pct">${Math.round(out.p[i] * 100)}%</span></div>`).join("");
-  const counts = {};
-  for (const l of labelled) if (l.i > 1) counts[l.i] = (counts[l.i] || 0) + 1;
-  $("things").innerHTML = Object.entries(counts).map(([i, c]) => `<span class="thing">${things[i].emoji} ${things[i].name} <small>${c}</small></span>`).join("");
-  const t = things[out.best];
-  $("bigEmoji").textContent = out.state === "known" ? t.emoji : out.state === "unsure" ? "🤔" : "";
-  $("bigName").textContent = out.state === "known" ? t.name : "";
+  const top = Object.keys(out.probs).sort((a, b) => out.probs[b] - out.probs[a]).slice(0, 5);
+  $("rows").innerHTML = top.map((n, r) => `
+    <div class="row${r === 0 ? " top" : ""}"><span class="emoji">${emoji[n]}</span>
+      <div class="track"><div class="fill" style="width:${out.probs[n] * 100}%"></div>${things.prompts[things.names.indexOf(n)] ? `<div class="zero" style="left:${out.zero[n] * 100}%"></div>` : ""}
+        <span class="label">${n}</span></div><span class="pct">${Math.round(out.probs[n] * 100)}%</span></div>`).join("");
+  $("things").innerHTML = Object.entries(things.counts()).filter(([n]) => !things.quiet.has(n))
+    .map(([n, c]) => `<span class="thing">${emoji[n]} ${n} <small>${c.you}</small></span>`).join("");
+  $("bigEmoji").textContent = out.state === "sure" ? emoji[out.name] : out.state === "unsure" ? "🤔" : "";
+  $("bigName").textContent = out.state === "sure" ? out.name : "";
 }
 
 // ---- talking: one line at a time
@@ -277,9 +150,9 @@ function say(text) {
   speechSynthesis.speak(u);
 }
 function decide(out) {
-  if (teaching || !model) return;
-  const name = things[out.best].name;
-  if (out.state === "known") {
+  if (teaching) return;
+  const name = out.name;
+  if (out.state === "sure") {
     unsure = quiet = 0;
     streak = streak.name === name ? { name, n: streak.n + 1 } : { name, n: 1 };
     if (streak.n >= STABLE && name !== lastSaid && !speaking) {
@@ -306,9 +179,9 @@ function status(kind, text) {
   $("status").textContent = text || "";
 }
 async function teach(typed, thank) {  // a name can carry its own emoji: "seashell 🐚"
-  const emoji = [...typed].find(ch => /\p{Extended_Pictographic}/u.test(ch)) || "";
+  const given = [...typed].find(ch => /\p{Extended_Pictographic}/u.test(ch)) || "";
   const name = typed.replace(/[\p{Extended_Pictographic}\uFE0F]/gu, "").trim() || typed;
-  teaching = { name, emoji, until: performance.now() + TEACH_MS };
+  teaching = { name: things.find(name) ?? name, emoji: given, until: performance.now() + TEACH_MS };
   status("teach", `learning ${name}…`);
   await new Promise(r => setTimeout(r, TEACH_MS));
   teaching = null;
@@ -328,15 +201,16 @@ $("go").onclick = async () => {
     const stream = navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } });
     $("progress").style.display = "block";
     const t0 = performance.now();
-    const known = (await (await fetch("things.json")).json());
-    things = known.things.map(t => ({ ...t, prompt: Float64Array.from(t.prompt) }));
+    const known = await (await fetch("things.json")).json();
+    things = new Choice(Object.fromEntries(known.things.map(t => [t.name, t.prompt])),
+                        { quiet: ["nothing", "hand"], empty: "nothing" });
+    for (const t of known.things) emoji[t.name] = t.emoji;
     phrases = known.phrases;
-    model = await load("weights", { onProgress: (at, total) => {
+    eyes = await Eyes.open({ weights: "weights", tokens: 70, onProgress: (at, total) => {
       $("progress").value = at / total;
       $("why").textContent = `downloading EG2's image path: ${(at / 1e6).toFixed(0)} of ${(total / 1e6).toFixed(0)} MB`;
     } });
-    const info = model.adapter.info || {};
-    $("gpu").textContent = info.description || (info.vendor ? `your ${info.vendor[0].toUpperCase() + info.vendor.slice(1)} GPU` : "your GPU");
+    $("gpu").textContent = eyes.gpu;
     $("video").srcObject = await stream;
     await $("video").play();
     $("start").remove();
@@ -361,9 +235,7 @@ addEventListener("keydown", e => { if (e.key === "0" && e.target.tagName !== "IN
 addEventListener("keyup", e => { if (e.key === "0") held0 = false; });
 $("mute").onclick = () => { muted = !muted; $("mute").textContent = muted ? "Unmute voice" : "Mute voice"; if (muted) speechSynthesis.cancel(); };
 $("forget").onclick = () => {
-  generation++;
-  labelled = []; student = null; empty = null; residuals = [];
-  things = things.filter(t => t.prompt);
+  things.forget();
   lastSaid = null;
   teach("nothing", false);
 };

@@ -5,8 +5,8 @@ the embedding, the student and the voice all stay in the tab, and nothing is ins
 
 ```bash
 uv run examples/browser/convert.py          # the image path's weights -> examples/browser/weights/ (580 MB, once)
-cd examples/browser && python3 -m http.server 8803 --bind 127.0.0.1
-# open http://localhost:8803 in Chrome, press Start, allow the camera
+python3 -m http.server 8803 --bind 127.0.0.1    # from the repository's root
+# open http://localhost:8803/examples/browser/ in Chrome, press Start, allow the camera
 ```
 
 **Needs:** the EmbeddingGemma 2 checkpoint in the Hugging Face cache (`download.py`), and a browser with WebGPU
@@ -14,7 +14,7 @@ cd examples/browser && python3 -m http.server 8803 --bind 127.0.0.1
 
 ## What it does
 
-- **The engine** (`model.js`, `kernels.js`): EG2's image path as about 680 WebGPU compute dispatches, recorded once
+- **The engine** ([`hunch/web/eg2/`](../../hunch/web/eg2/), `model.js` and `kernels.js`): EG2's image path as about 680 WebGPU compute dispatches, recorded once
   per image size and replayed in one command buffer per frame. The 16-layer vision tower (2-D RoPE, flash
   attention), 3x3 pooling, the 24-layer text tower over the soft tokens, mean pooling, `out_proj` and the L2 norm all
   run on the GPU; decoding and the antialiased bicubic resize are ports of `eg2cpu/src/vision.rs` in JavaScript.
@@ -24,8 +24,9 @@ cd examples/browser && python3 -m http.server 8803 --bind 127.0.0.1
   audio tower and the 262k-row vocabulary table are left out: 580 MB of the checkpoint's 1.4 GB.
 - **The things it knows** (`things.py`): the browser runs no text path, so the ~45 everyday things of the
   [objects](../objects/) demo arrive as one prompt vector each, embedded once with eg2cpu. The demo is that one's
-  zero-shot prompts, empty-hands baseline and student, without the server: the student (a logistic regression on
-  standardised embeddings, classes weighted equally) trains in a web worker, and the browser's own voices speak.
+  zero-shot prompts, empty-hands baseline and student, without the server: a `Choice` from hunch.live's browser
+  version ([`hunch/web/live.ts`](../../hunch/web/live.ts)), whose student trains in a web worker, and the browser's
+  own voices speak.
   There is no teacher here.
 - **Teaching:** hold a thing up, type its name (an emoji in the name becomes its emoji: "seashell 🐚") and press
   enter; the next two seconds of frames are labelled with it.
