@@ -1,7 +1,7 @@
 # hunch
 
-hunch sits in front of a model you already use to answer questions about agent traces, such as "did this tool call
-fail?", and learns to answer the easy ones itself.
+hunch sits in front of a /v1/systemone model you already use to answer questions about textual data, such as 
+"did this tool call fail in this agent trace?", and learns to answer the easy ones itself.
 
 - **The teacher** is that model: an LLM judge or a dedicated decision model behind HTTP. hunch sends it every
   question it can't answer yet and keeps the answers.
@@ -46,7 +46,7 @@ hunch POSTs the teacher the request it received, `{"state": ..., "questions": {i
 - `choice`: `{"type": "choice", "probabilities": {"test_run": 0.9, "build": 0.05, "other": 0.05}}`;
 - `score`: `{"type": "score", "probabilities": {"0": 0.1, "1": 0.7, "2": 0.2}}`, by level index.
 
-hunch's own answers have the same shape, plus `choice` or `score` and `confidence` fields.
+hunch's response is the same, plus `choice` or `score` and `confidence` fields.
 
 `--backend` is the teacher's URL, or `offline:<file or folder>` to replay recorded answers (as the examples do; a
 missing answer is then an error, unless `--fallback <url>` names a teacher to ask, and `--record <file>` saves its
