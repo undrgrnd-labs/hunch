@@ -160,3 +160,40 @@ def test_album_keeps_frames_and_sets_them_aside(tmp_path, eyes):
     assert z.shape == x.shape
     album.set_aside()
     assert album.frames() == [] and list(tmp_path.glob("labels.*.jsonl"))
+
+
+def test_texts_are_frames_too(tmp_path, eyes):
+    c = Choice(eyes, {"fine": ["the call worked fine"], "failed": ["the call failed"]}, new=lambda name: [name])
+    x, _ = eyes.see("read_file returned: the call failed")
+    assert c.ask(x)["name"] == "failed"
+    for _ in range(4):
+        c.teach(eyes.see("pytest: 3 passed, then timeout")[0], "timeout")
+        c.teach(eyes.see("pytest: 3 passed, all fine")[0], "fine")
+    settled(c)
+    assert c.ask(eyes.see("npm test: timeout")[0])["name"] == "timeout"
+
+    album = Album(tmp_path, eyes)
+    album.keep("pytest: 3 passed, then timeout", x, thing="timeout")
+    [(y, row)] = album.frames()
+    assert row["file"].endswith(".txt") and np.allclose(x, y)
+    (tmp_path / row["file"]).with_suffix(".npy").unlink()
+    [(z, _)] = album.frames()  # embedded again from the text
+    assert np.allclose(z, eyes.see("pytest: 3 passed, then timeout")[0])
+
+
+def test_long_texts_are_clipped_like_the_proxys(eyes):
+    long = "start " + "x " * 4000 + "failed"
+    assert np.allclose(eyes.see(long)[0], eyes.see("failed")[0])  # the tail survives the clip
+
+
+def test_watcher_passes_texts_to_the_teacher(eyes):
+    c = make_choice(eyes)
+    seen = []
+
+    def teacher(text, names):
+        seen.append(text)
+        return {"pen": 0.9}
+
+    Watcher(c, teacher, rest=0).look("a pen", eyes.see("a pen")[0], {"state": "unsure", "name": "cat", "shown": None})
+    time.sleep(0.1)
+    assert seen == ["a pen"] and c.counts()["pen"] == {"teacher": 1}

@@ -1,17 +1,20 @@
-"""hunch.live: questions about a live stream of images (a webcam), answered from one EG2 embedding per frame.
+"""hunch.live: questions about a live stream (a webcam, or texts as they arrive), answered from one EG2 embedding per
+item.
 
 The proxy (`hunch.proxy`) learns typed questions about text states behind a teacher. This is the same idea for a
-stream that a person watches and teaches as it goes: every frame wants an answer within the frame time, and the
-answers it can give grow while it runs.
+stream that a person watches and teaches as it goes: every item wants an answer as it arrives, and the answers it
+can give grow while it runs. An item is an image (JPEG or PNG bytes) or a text; the classes below call either a
+frame.
 
-  Eyes      EG2 on frames (one forward pass at a time) and on text prompts.
+  Eyes      EG2 on frames (one forward pass at a time) and on text prompts. A text frame is embedded like a prompt,
+            by the full pass (the proxy reads layer 8 instead), so it shares the prompts' space.
   Choice    picks one answer. Every answer has text prompts, so it answers zero-shot from the start; labelled
             frames train a student, which answers as far as a frame resembles what it was taught. Answers can be
             added while it runs, and `forget` goes back to the ones it started with.
   Detector  says yes or no: text prompts, plus a direction taught from one frame with the thing and one without.
   Watcher   a teacher model watching the stream: it looks at the newest frame when that's worth it, one look at a
             time, and labels the frames it's sure about for a Choice's student.
-  Album     labelled frames on disk (JPEG, embedding, labels.jsonl), to teach again after a restart.
+  Album     labelled frames on disk (the image or text, its embedding, labels.jsonl), to teach again after a restart.
 
 How a Choice answers:
   zero-shot  a frame scores each answer by its mean similarity to the answer's prompts, standardised across the
@@ -45,6 +48,8 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 
+from .proxy import encoder_text
+
 ELSE = "something else"  # a teacher's answer for a frame that shows none of the answers
 
 
@@ -70,9 +75,12 @@ def grey_png(side: int = 64) -> bytes:
             + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
 
 
+Frame = bytes | str  # an image's bytes, or a text
+
+
 class Eyes:
-    """EG2 on frames, `tokens` soft tokens each, one forward pass at a time (frames queue with the caller), and on
-    text prompts."""
+    """EG2 on frames, one forward pass at a time (frames queue with the caller): an image at `tokens` soft tokens, a
+    text as the encoder reads it (the head and tail of a long one, as the proxy clips it). And on text prompts."""
 
     def __init__(self, model=None, tokens: int = 70):
         if model is None:
@@ -81,11 +89,14 @@ class Eyes:
         self.model, self.tokens = model, tokens
         self.lock = threading.Lock()
 
-    def see(self, image: bytes) -> tuple[np.ndarray, float]:
+    def see(self, frame: Frame) -> tuple[np.ndarray, float]:
         """(unit embedding, milliseconds of EG2), timed inside the lock so the wait for another frame isn't counted."""
         with self.lock:
             t0 = time.perf_counter()
-            x = unit(self.model.embed_image(image, max_soft_tokens=self.tokens)[0])
+            if isinstance(frame, str):
+                x = unit(self.model.embed(encoder_text(frame))[0])
+            else:
+                x = unit(self.model.embed_image(frame, max_soft_tokens=self.tokens)[0])
             return x, (time.perf_counter() - t0) * 1000
 
     def read(self, texts: list[str]) -> np.ndarray:
@@ -300,17 +311,17 @@ class Detector:
 
 
 class Watcher:
-    """A teacher model watching the stream for a Choice. `teacher(image, names)` answers which of `names` (or `ELSE`)
-    the frame shows, as {answer: probability}; it's called one look at a time, from the Watcher's own thread.
+    """A teacher model watching the stream for a Choice. `teacher(frame, names)` answers which of `names` (or `ELSE`)
+    the frame (an image's bytes or a text) shows, as {answer: probability}; it's called one look at a time, from the Watcher's own thread.
 
     It looks at the newest frame when the student's answer is a thing it hasn't agreed on in the last `confirmed`
     seconds, or, when the answer is quiet, every `idle` seconds while something is being shown (a held thing can read
     as a bare hand), resting `rest` seconds between looks. Sure of an answer (`sure`), it labels the frame for the
-    student, up to `cap` frames per answer, and calls `on_label(image, x, name)`."""
+    student, up to `cap` frames per answer, and calls `on_label(frame, x, name)`."""
 
-    def __init__(self, choice: Choice, teacher: Callable[[bytes, list[str]], dict[str, float]], *, by: str = "teacher",
+    def __init__(self, choice: Choice, teacher: Callable[[Frame, list[str]], dict[str, float]], *, by: str = "teacher",
                  sure: float = 0.5, cap: int = 60, rest: float = 0.3, confirmed: float = 3.0, idle: float = 3.0,
-                 fresh: float = 1.5, on_label: Callable[[bytes, np.ndarray, str], None] | None = None):
+                 fresh: float = 1.5, on_label: Callable[[Frame, np.ndarray, str], None] | None = None):
         self.choice, self.teacher, self.by, self.on_label = choice, teacher, by, on_label
         self.sure, self.cap, self.rest, self.confirmed, self.idle, self.fresh = sure, cap, rest, confirmed, idle, fresh
         self.newest = None
@@ -321,7 +332,7 @@ class Watcher:
         self.looked: deque[float] = deque(maxlen=200)
         threading.Thread(target=self._watching, daemon=True).start()
 
-    def look(self, image: bytes, x: np.ndarray, answer: dict) -> None:
+    def look(self, frame: Frame, x: np.ndarray, answer: dict) -> None:
         """Offers the newest frame and the student's answer for it; the teacher looks if that's worth it."""
         now = time.time()
         if answer["state"] == "quiet":
@@ -330,7 +341,7 @@ class Watcher:
         else:
             worth = now - self.agreed.get(answer["name"], 0) > self.confirmed
         if worth:
-            self.newest = (image, x)
+            self.newest = (frame, x)
             self.wake.set()
 
     def forget(self) -> None:
@@ -342,10 +353,10 @@ class Watcher:
         while True:
             self.wake.wait()
             self.wake.clear()
-            image, x = self.newest
+            frame, x = self.newest
             self.looked.append(time.time())
             t0 = time.perf_counter()
-            out = self.teacher(image, list(self.choice.names))
+            out = self.teacher(frame, list(self.choice.names))
             ms = (time.perf_counter() - t0) * 1000
             best = max(out, key=out.get)
             p = out[best]
@@ -359,7 +370,7 @@ class Watcher:
                 if self.choice.counts().get(name, {}).get(self.by, 0) < self.cap:
                     self.choice.teach(x, name, by=self.by)
                     if self.on_label is not None:
-                        self.on_label(image, x, name)
+                        self.on_label(frame, x, name)
             time.sleep(self.rest)
 
     def saw_else(self) -> bool:
@@ -380,19 +391,22 @@ class Watcher:
 
 
 class Album:
-    """Labelled frames in `folder`: each JPEG, its embedding (cached per soft-token budget) and a line of
-    labels.jsonl with whatever fields describe the label."""
+    """Labelled frames in `folder`: each image (.jpg) or text (.txt), its embedding (an image's cached per soft-token
+    budget) and a line of labels.jsonl with whatever fields describe the label."""
 
     def __init__(self, folder: str | Path, eyes: Eyes):
         self.folder, self.eyes = Path(folder), eyes
         self.labels = self.folder / "labels.jsonl"
         self.lock = threading.Lock()
 
-    def keep(self, image: bytes, x: np.ndarray, **fields) -> None:
+    def keep(self, frame: Frame, x: np.ndarray, **fields) -> None:
         self.folder.mkdir(parents=True, exist_ok=True)
-        path = self.folder / f"{time.time_ns()}.jpg"
-        path.write_bytes(image)
-        np.save(path.with_suffix(f".{self.eyes.tokens}.npy"), x)
+        path = self.folder / f"{time.time_ns()}.{'txt' if isinstance(frame, str) else 'jpg'}"
+        if isinstance(frame, str):
+            path.write_text(frame)
+        else:
+            path.write_bytes(frame)
+        np.save(self._cache(path), x)
         with self.lock, self.labels.open("a") as f:
             f.write(json.dumps({"file": path.name} | fields) + "\n")
 
@@ -403,14 +417,18 @@ class Album:
         out = []
         for line in self.labels.read_text().splitlines():
             row = json.loads(line)
-            cached = (self.folder / row["file"]).with_suffix(f".{self.eyes.tokens}.npy")
+            path = self.folder / row["file"]
+            cached = self._cache(path)
             if cached.exists():
                 x = np.load(cached)
             else:
-                x, _ = self.eyes.see((self.folder / row["file"]).read_bytes())
+                x, _ = self.eyes.see(path.read_text() if path.suffix == ".txt" else path.read_bytes())
                 np.save(cached, x)
             out.append((x, row))
         return out
+
+    def _cache(self, path: Path) -> Path:
+        return path.with_suffix(".npy" if path.suffix == ".txt" else f".{self.eyes.tokens}.npy")
 
     def set_aside(self) -> None:
         """Moves the labels to labels.<time>.jsonl, so they aren't taught again; the frames stay."""
