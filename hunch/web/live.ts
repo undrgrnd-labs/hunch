@@ -198,6 +198,16 @@ export interface ChoiceOptions {
   gap?: number; // seconds between an answer's counted checks
 }
 
+export interface Progress {
+  checks: number;
+  agree: number | null;
+  low: number;
+  high: number;
+  graduated: boolean;
+  needed: number | null;
+  done: number;
+}
+
 interface Labelled {
   x: Vector;
   i: number;
@@ -286,14 +296,30 @@ export class Choice {
     return truth === name;
   }
 
-  /** Per checked answer: its checks, their agreement and its 95% bounds, and whether it has graduated. */
-  report(): Record<string, { checks: number; agree: number; low: number; high: number; graduated: boolean }> {
-    const out: ReturnType<Choice['report']> = {};
-    for (const [name, record] of this.checks) {
-      const k = record.filter(Boolean).length, [low, high] = wilson(k, record.length);
-      out[name] = { checks: record.length, agree: k / record.length, low, high, graduated: this.graduated.has(name) };
+  /** Per checked answer, its `progress`. */
+  report(): Record<string, Progress> {
+    return Object.fromEntries([...this.checks.keys()].map((name) => [name, this.progress(name)]));
+  }
+
+  /** An answer's way to graduating: its checks, their agreement and its 95% bounds, whether it has graduated,
+   * `needed`, the agreeing checks it still needs (0 once graduated; null if it can't within a window), and `done`, the
+   * share of the way there: checks / (checks + needed). */
+  progress(name: string): Progress {
+    const o = this.opts, record = this.checks.get(name) ?? [], graduated = this.graduated.has(name);
+    const k = record.filter(Boolean).length, m = record.length, [low, high] = wilson(k, m);
+    let needed: number | null = graduated ? 0 : null;
+    if (!graduated) { // agreeing checks still to come, the oldest leaving the window as they arrive
+      let ahead = [...record];
+      for (let more = 0; more <= o.window + o.minChecks; more++) {
+        if (ahead.length >= o.minChecks && wilson(ahead.filter(Boolean).length, ahead.length)[0] >= o.target) {
+          needed = more;
+          break;
+        }
+        ahead = [...ahead, true].slice(-o.window);
+      }
     }
-    return out;
+    const done = graduated ? 1 : needed === null ? 0 : m / (m + needed);
+    return { checks: m, agree: m ? k / m : null, low, high, graduated, needed, done };
   }
 
   /** Back to the answers it started with: the labelled frames go, and so do the answers added since. */

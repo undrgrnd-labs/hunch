@@ -285,7 +285,8 @@ def for_page(a):
             "top": [{"name": n, "emoji": emoji_of(n), "p": round(a["probs"][n], 3), "zero": round(a["zero"][n], 3)}
                     for n in top],
             "shown": None if a["shown"] is None else round(a["shown"], 2), "resemble": round(a["resemble"], 3),
-            "labelled": counts, "ready": a["ready"]}
+            "labelled": counts, "ready": a["ready"],
+            "graduation": things.progress(a["name"]) if watcher is not None and a["state"] == "sure" else None}
 
 
 class Handler(BaseHTTPRequestHandler):

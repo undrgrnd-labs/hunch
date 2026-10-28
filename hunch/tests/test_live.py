@@ -232,8 +232,8 @@ def test_only_sure_answers_count_and_neighbouring_frames_count_once(eyes):
 def test_a_label_checks_the_answer_given_before_it(eyes):
     c = make_choice(eyes, gap=0)
     c.teach(frame(eyes, b"pen"), "mug")  # zero-shot said pen, sure; the label says mug
-    assert c.report()["pen"] == pytest.approx({"checks": 1, "agree": 0.0, "low": 0.0, "high": c.report()["pen"]["high"],
-                                               "graduated": False})
+    pen = c.report()["pen"]
+    assert (pen["checks"], pen["agree"], pen["graduated"]) == (1, 0.0, False)
     c.teach(frame(eyes, b"cat"), "cat", check=False)
     assert "cat" not in c.report()
 
@@ -291,3 +291,19 @@ def test_the_watcher_checks_only_steady_answers(eyes):
     w.look(b"pen", x, sure("pen"))
     time.sleep(0.1)
     assert c.report()["pen"]["checks"] == 1
+
+
+def test_progress_counts_the_agreeing_checks_still_needed(eyes):
+    c = make_choice(eyes, gap=0)
+    fresh = c.progress("mug")
+    assert fresh["checks"] == 0 and fresh["agree"] is None and fresh["done"] == 0
+    assert fresh["needed"] == 35  # 35 of 35 is the first all-agreeing record whose lower bound reaches 0.9
+    for _ in range(10):
+        c.check(sure("mug"), "mug")
+    assert c.progress("mug")["needed"] == 25 and c.progress("mug")["done"] == pytest.approx(10 / 35)
+    c.check(sure("mug"), "pen")
+    assert c.progress("mug")["needed"] > 25  # a disagreement costs more than the check it took
+    while not c.progress("mug")["graduated"]:
+        c.check(sure("mug"), "mug")
+    assert c.progress("mug")["needed"] == 0 and c.progress("mug")["done"] == 1.0
+    assert c.report()["mug"] == c.progress("mug")

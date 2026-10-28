@@ -15,6 +15,11 @@
   .big .emoji { font-size: 110px; line-height: 1.1; transition: transform .15s; display: block; }
   .big .emoji.pop { transform: scale(1.25); }
   .big .name { font-size: 26px; font-weight: 700; }
+  .grad { display: none; width: 160px; margin: 6px 0 0 auto; }
+  .grad .track { height: 8px; background: #fff3; border-radius: 4px; overflow: hidden; }
+  .grad .fill { height: 100%; width: 0; background: var(--clef); transition: width .3s; }
+  .grad.done .fill { background: var(--hit); }
+  .grad .text { font-size: 13px; font-weight: 600; margin-top: 3px; font-variant-numeric: tabular-nums; white-space: nowrap; }
   .status { position: absolute; left: 16px; top: 16px; padding: 6px 14px; border-radius: 999px; font-weight: 600; display: none; }
   .status.on { display: block; }
   .status.teach { background: var(--hit); color: #06210f; }
@@ -58,7 +63,8 @@
 <main>
   <div class="stage">
     <video id="video" autoplay playsinline muted></video>
-    <div class="big"><span class="emoji" id="bigEmoji"></span><span class="name" id="bigName"></span></div>
+    <div class="big"><span class="emoji" id="bigEmoji"></span><span class="name" id="bigName"></span>
+      <div class="grad" id="grad"><div class="track"><div class="fill" id="gradFill"></div></div><div class="text" id="gradText"></div></div></div>
     <div class="status" id="status"></div>
     <div class="start" id="start"><button>Start: camera, mic and voice</button></div>
     <div class="captions"><div id="said"></div><div id="heard"></div></div>
@@ -165,6 +171,14 @@ function show(out) {
   const quietThing = out.state === "quiet";
   $("bigEmoji").textContent = quietThing ? "" : out.state === "unsure" ? "🤔" : out.emoji;
   $("bigName").textContent = quietThing ? "" : out.state === "unsure" ? "" : out.name;
+  // how close the named thing is to graduating: its checks against Clef, out of the checks it needs
+  const g = out.graduation;
+  $("grad").style.display = g ? "block" : "none";
+  if (g) {
+    $("grad").classList.toggle("done", g.graduated);
+    $("gradFill").style.width = (g.done * 100) + "%";
+    $("gradText").textContent = g.graduated ? "🎓 graduated" : g.needed === null ? "learning" : `${g.needed} checks to go`;
+  }
 }
 const emojiOf = {};
 

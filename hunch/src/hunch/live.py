@@ -216,14 +216,31 @@ class Choice:
             return record[-1]
 
     def report(self) -> dict[str, dict]:
-        """Per checked answer: its checks, their agreement and its 95% bounds, and whether it has graduated."""
-        out = {}
+        """Per checked answer, its `progress`."""
         with self.adding:
-            for name, record in self.checks.items():
-                low, high = wilson(sum(record), len(record))
-                out[name] = {"checks": len(record), "agree": sum(record) / len(record), "low": low, "high": high,
-                             "graduated": name in self.graduated}
-        return out
+            names = list(self.checks)
+        return {name: self.progress(name) for name in names}
+
+    def progress(self, name: str) -> dict:
+        """An answer's way to graduating: its checks, their agreement and its 95% bounds, whether it has graduated,
+        `needed`, the agreeing checks it still needs (0 once graduated; None if it can't within a window), and
+        `done`, the share of the way there: checks / (checks + needed)."""
+        with self.adding:
+            record = deque(self.checks.get(name, ()), maxlen=self.window)
+            graduated = name in self.graduated
+        k, m = sum(record), len(record)
+        low, high = wilson(k, m)
+        needed = 0 if graduated else None
+        if not graduated:  # agreeing checks still to come, the oldest leaving the window as they arrive
+            ahead = deque(record, maxlen=self.window)
+            for more in range(self.window + self.min_checks + 1):
+                if len(ahead) >= self.min_checks and wilson(sum(ahead), len(ahead))[0] >= self.target:
+                    needed = more
+                    break
+                ahead.append(True)
+        done = 1.0 if graduated else 0.0 if needed is None else m / (m + needed)
+        return {"checks": m, "agree": k / m if m else None, "low": low, "high": high, "graduated": graduated,
+                "needed": needed, "done": done}
 
     def forget(self) -> None:
         """Back to the answers it started with: the labelled frames go, and so do the answers added since."""
