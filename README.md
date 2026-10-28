@@ -43,7 +43,7 @@ in real-time on both text and images, learning from both a teacher model and use
 ### Caveats
 
 hunch works for a lot of questions, but not all questions. hunch is fast because it doesn't think, so that means if your
-questions need a lot of indirect reasoning, the other judges will be a better fit (we have some [question design guidance for this](docs/question-design.md)). 
+questions need a lot of indirect reasoning, like "how bad is this failure, and who can fix it?", the other judges will be a better fit (we have some [question design guidance for this](docs/question-design.md), with a pre-flight check that tells you which of your questions hunch can take over). 
 But don't worry - if hunch never graduates from learning, it keeps passing the questions up to the teacher indefinitely
 instead of trying to answer something it isn't capable of.
 
@@ -88,13 +88,6 @@ You keep your judge in the loop, but you call it less!
 - **Meets or beats the teacher alone.** hunch tries to distill the teacher's answer to the question, but the combination
   of hunch + teacher often beats a teacher or EG2 alone (this depends on the question - see caveats).
 - **No GPU.** EmbeddingGemma 2 is run using a highly-tuned Rust engine for commodity CPUs.
-
-### Where it doesn't fit
-
-hunch works best when the answer is in the text. "How bad is this failure, and who can fix
-it?" needs context and reasoning in many cases. You can still use hunch in these cases, and it will
-forward those on to the upstream judge instead of guessing badly. [docs/question-design.md](docs/question-design.md) has a
-pre-flight check that tells you which of your questions hunch can take over before you deploy.
 
 ## What's here
 

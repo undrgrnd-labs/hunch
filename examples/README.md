@@ -8,10 +8,8 @@ each example, keyed by hashes, so every comparison replays without running it.
 
 ## Setup
 
-You need a Rust toolchain (1.88 or later), because `uv sync` builds eg2cpu from `../eg2cpu` (about a minute the first
-time), and [uv](https://docs.astral.sh/uv/), which also fetches Python 3.12. Every example needs the EmbeddingGemma 2
-checkpoint (1.4 GB), which is Apache-2.0 and not gated on the Hub (as of October 2026). Run every command here from
-`examples/`.
+Follow the [repository's setup](../README.md#setup) first (Rust, uv and the EmbeddingGemma 2 checkpoint, which every
+example needs). Run every command here from `examples/`.
 
 ```bash
 cd examples
@@ -44,9 +42,10 @@ No dataset text ships with the examples. What does:
   results labelled by an LLM whose model and prompt were not recorded; `failure_severity_stream_labels.jsonl`: every
   result of the stream, labelled by Claude Opus 5.5 with the severity question's rubric). Each row is a state hash with its labels; the text is rebuilt from the downloaded
   traces and checked against the hash (`hunch_examples.shipped_rows`).
-- **The teacher's (Clef's) answers**, hashed: `<example>/teacher.jsonl`, and `data/teacher_stream.jsonl` for the stream.
-- **Synthetic labelled data written for these examples:** the decision specs in `decisions/` (matched contrasts and
-  hard negatives), the benign twins for InjecAgent (`hunch_examples/injection_fillers.py`), the PII hard negatives
+- **The teacher's (Clef's) answers**, hashed: `<example>/teacher.jsonl`, and `data/teacher_stream.jsonl` for the stream
+  (see [The teacher answers](#the-teacher-answers)).
+- **Synthetic labelled data written for these examples:** the decision specs in `decisions/` (matched [contrasts and
+  hard negatives](../docs/glossary.md#directions-readout-methods)), the benign twins for InjecAgent (`hunch_examples/injection_fillers.py`), the PII hard negatives
   (`hunch_examples/pii_data.py`) and synthetic coding-tool pairs (`hunch_examples.synthetic`).
 - **The question pilot's record:** its candidate questions, selections and dev and test logs
   (`question_pilot/recorded/`).
@@ -61,7 +60,7 @@ Run any one from this folder with `uv run <example>/<example>.py`. Times are fro
 | example | question | needs | time |
 |---|---|---|---|
 | [`tool_call_failed`](tool_call_failed/) | Does a compiled `tool_call_failed` decision work on real coding-agent traces, and does it abstain on support-bot outputs? | pi, tau2 | 3 min |
-| [`layer_auto`](layer_auto/) | Does `layer: auto` pick the layer that transfers best? | pi, gretel | 6 min |
+| [`layer_auto`](layer_auto/) | Does [`layer: auto`](../docs/glossary.md#automatic-choices-fixed-rules) pick the layer that transfers best? | pi, gretel | 6 min |
 | [`failure_severity`](failure_severity/) | Can a `kind: levels` decision grade failure severity? | pi | 1 min |
 | [`failure_severity_hybrid`](failure_severity_hybrid/) | The harness flag first, then a graded decision on flagged errors | pi | 3 min |
 | [`levels_sst5`](levels_sst5/) | `kind: levels` on a public ordinal dataset (SST-5 sentiment) | sst5 | 1 min |
@@ -69,7 +68,7 @@ Run any one from this folder with `uv run <example>/<example>.py`. Times are fro
 | [`injection_teacher`](injection_teacher/) | Is the teacher worth distilling for injection? | InjecAgent, pi | 15 s |
 | [`pii`](pii/) | Can embeddings tell that a text holds PII, which kind, and from which layer? | gretel | 4 min |
 | [`proxy_replay`](proxy_replay/) | The proxy policy over 2,000 teacher answers: what graduates, at what agreement and cost | pi | 3 min |
-| [`proxy_early_exit`](proxy_early_exit/) | Layer-8 students vs full-pass students, and cascades | pi | 1 min |
+| [`proxy_early_exit`](proxy_early_exit/) | Layer-8 students vs full-pass students, and [cascades](../docs/glossary.md#the-proxy-hunch) | pi | 1 min |
 | [`proxy_service`](proxy_service/) | The proxy as an HTTP service, end to end | pi | 1 min |
 | [`question_pilot`](question_pilot/) | Teach the teacher: reword its question from where it's wrong and EG2 is right | pi, InjecAgent, gretel | minutes offline |
 | [`preflight`](preflight/) | Will a question graduate? A check on 150–300 teacher answers | your answers file | 1 min |
@@ -79,7 +78,7 @@ Run any one from this folder with `uv run <example>/<example>.py`. Times are fro
 
 ## Results
 
-Against ground truth. Each cell is accuracy, or QWK for graded questions, then macro-F1. Each column follows one rule,
+Against ground truth. Each cell is accuracy, or [QWK](../docs/glossary.md#metrics-and-intervals) for graded questions, then macro-F1. Each column follows one rule,
 the same in every row, fixed before the results were read:
 - **EG2:** the example's compiled decision, exactly as its spec is written (its readout, its 60 calibration rows).
 - **EG2, 200 labels (†):** a student on EG2 features (logistic regression) trained on the calibration rows plus up

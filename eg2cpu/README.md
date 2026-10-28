@@ -53,27 +53,14 @@ at both 70 and 280 soft tokens: cosine 0.67-0.73, against 0.48-0.61 for the othe
 The soft-token budget (70, 140, 280, 560 or 1120) sets the resolution, and the vision tower's cost grows with it.
 `embed_image` uses the processor's default of 280.
 
-On an Apple M5 Pro with SME, one image takes about 95 ms at 70 soft tokens and 500 ms at the default 280, most of it
+On an Apple M5 Pro with SME, one image takes about 98 ms at 70 soft tokens and 496 ms at the default 280, most of it
 in the vision tower; without SME (`EG2_SME=off`) 248 ms and 1.2 s. The first image also loads the vision tower, about
 170 ms. Per-step timings are in [../docs/performance.md](../docs/performance.md).
-
-**Accuracy** (`tests/image_reference.rs`, against PyTorch fp32 through `AutoProcessor`):
-- PNG images: the resized pixels are identical; soft tokens are within 5e-6 relative; embeddings have cosine
-  ≥ 0.9999994.
-- JPEG: `jpeg-decoder` and PIL's libjpeg-turbo disagree on about 5% of decoded values, by a few levels, which gives
-  cosine 0.99988 on the test photo.
-
-**Memory.** The vision tower adds about 300 MB of packed weights, loaded on the first image; the 31 MB position table
-stays memory-mapped. Activations add about 30 MB per image at 70 soft tokens and 130 MB at 280. Peak footprint is
-419 MB for text only, 762 MB after one image at 70 soft tokens, and 850 MB at 280.
 
 **Not supported:**
 - audio and video;
 - several images, or text and images interleaved, in one input;
 - formats other than PNG, JPEG and WebP (no GIF, HEIC or TIFF).
-
-Images also bypass the request scheduler: each call runs at once, on a pool of the performance cores plus two
-(`EG2_VISION_THREADS`), so `EG2_MAX_IN_FLIGHT` doesn't bound images.
 
 ## Python
 
@@ -138,14 +125,19 @@ matmuls into tiles, attention by (head, 32-query block), and norms, RoPE and GEL
 - **Calls from inside the pool** (nested use) run directly. `forward_batch_with` runs a batch directly with an
   explicit bound, bypassing the scheduler.
 
+Images also bypass the request scheduler: each call runs at once, on a pool of the performance cores plus two
+(`EG2_VISION_THREADS`), so `EG2_MAX_IN_FLIGHT` doesn't bound images.
+
 `tests/concurrency.rs` checks that concurrent single and batch callers get results bit-identical to direct passes,
 and that a bad request panics only its own caller.
 
 ## Memory
 
 Once loaded, the text encoder's bf16 weights take 261 MB and the tokenizer about 136 MB. The 256 MB embedding table
-stays memory-mapped, so only the rows of tokens actually seen are read. The first image loads the vision tower's
-300 MB (see [Images](#images)). A forward pass in flight costs about 30 MB
+stays memory-mapped, so only the rows of tokens actually seen are read. The vision tower adds about 300 MB of packed
+weights, loaded on the first image; its 31 MB position table stays memory-mapped. Activations add about 30 MB per
+image at 70 soft tokens and 130 MB at 280. Peak footprint is 419 MB for text only, 762 MB after one image at 70 soft
+tokens, and 850 MB at 280. A forward pass in flight costs about 30 MB
 at 512 tokens; `EG2_MAX_IN_FLIGHT` bounds how many are in flight. Measured footprints are in
 [../docs/performance.md](../docs/performance.md).
 
@@ -300,9 +292,13 @@ outputs. The cases are 4, 18, 36, 687 (inside the 512 sliding window) and 1024 (
 difference is about 6e-7 on the embedding and 1.4e-6 relative on layer means, and cosine is 1.0000000. With
 `EG2_BF16=amx` or `bfmmla` the activations are rounded to bf16 too, and the embeddings agree to cosine ≥ 0.99999.
 
-`tests/image_reference.rs` does the same for images (see [Images](#images)): the resized pixels, the soft tokens, the
-layer means and the embedding, for four photos and a synthetic RGBA gradient at 280 and 70 soft tokens. It also
-checks the text-image similarities of four captions.
+`tests/image_reference.rs` does the same for images, against PyTorch fp32 through `AutoProcessor`: the resized
+pixels, the soft tokens, the layer means and the embedding, for four photos and a synthetic RGBA gradient at 280 and
+70 soft tokens. It also checks the text-image similarities of four captions.
+- PNG images: the resized pixels are identical; soft tokens are within 5e-6 relative; embeddings have cosine
+  ≥ 0.9999994.
+- JPEG: `jpeg-decoder` and PIL's libjpeg-turbo disagree on about 5% of decoded values, by a few levels, which gives
+  cosine 0.99988 on the test photo.
 
 ```bash
 cargo test --release
