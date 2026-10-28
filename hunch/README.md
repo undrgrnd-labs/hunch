@@ -298,6 +298,13 @@ watcher.look(jpeg, x, seen.ask(x))
   far as a frame resembles the frames it was taught, measured from the `empty` answer's frames.
 - A `Watcher` asks the teacher about the newest frame only when that's worth it, one look at a time, and labels the
   frames it's sure about.
+- Answers graduate as the proxy's questions do, but one answer at a time, since answers grow while it runs. A
+  sure answer is checked whenever the truth arrives for the same frame: a teacher's sure look, or a label someone
+  gives. An answer graduates once the 95% lower bound of its agreement reaches `target` (0.9; at least 20 checks,
+  at most one per second, so about 35 clean ones). It is demoted while the upper bound is below that. `ask()` says
+  whether the answer has graduated, and `report()` gives every answer's checks and bounds.
+- The `Watcher` looks whenever it can at answers that haven't graduated. It audits graduated ones at random moments,
+  every 10 s on average.
 - An `Album` keeps labelled frames (images or texts) on disk to teach again after a restart.
 - For text behind a teacher, the proxy is the better fit: it reads layer 8, graduates a question before answering it
   locally, audits, and forwards whatever it isn't sure of. `hunch.live` always answers, so it suits streams someone

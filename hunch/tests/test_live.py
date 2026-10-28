@@ -197,3 +197,80 @@ def test_watcher_passes_texts_to_the_teacher(eyes):
     Watcher(c, teacher, rest=0).look("a pen", eyes.see("a pen")[0], {"state": "unsure", "name": "cat", "shown": None})
     time.sleep(0.1)
     assert seen == ["a pen"] and c.counts()["pen"] == {"teacher": 1}
+
+
+def sure(name):
+    return {"state": "sure", "name": name, "shown": 5}
+
+
+def test_an_answer_graduates_on_agreeing_checks_and_is_demoted_when_they_stop(eyes):
+    c = make_choice(eyes, min_checks=20, gap=0, target=0.8)  # 19 of 19 already has a lower bound of 0.83
+    for _ in range(19):
+        assert c.check(sure("mug"), "mug") is True
+    assert "mug" not in c.graduated  # 19 checks: too few, however good
+    c.check(sure("mug"), "mug")
+    assert "mug" in c.graduated and c.report()["mug"]["low"] >= 0.8
+    for _ in range(6):
+        c.check(sure("mug"), "pen")
+    assert "mug" in c.graduated  # the upper bound is still above the target
+    while c.report()["mug"]["high"] >= 0.8:
+        c.check(sure("mug"), None)  # the teacher saw none of the answers
+    assert "mug" not in c.graduated
+    assert c.ask(frame(eyes, b"mug"))["graduated"] is False
+
+
+def test_only_sure_answers_count_and_neighbouring_frames_count_once(eyes):
+    c = make_choice(eyes, gap=60)
+    assert c.check({"state": "unsure", "name": "mug"}, "mug") is None
+    assert c.check({"state": "quiet", "name": "nothing"}, "nothing") is None
+    assert c.check(sure("mug"), "mug") is True
+    assert c.check(sure("mug"), "mug") is None  # within the gap
+    assert c.check(sure("pen"), "mug") is False  # another answer has its own gap
+    assert c.report()["mug"]["checks"] == 1
+
+
+def test_a_label_checks_the_answer_given_before_it(eyes):
+    c = make_choice(eyes, gap=0)
+    c.teach(frame(eyes, b"pen"), "mug")  # zero-shot said pen, sure; the label says mug
+    assert c.report()["pen"] == pytest.approx({"checks": 1, "agree": 0.0, "low": 0.0, "high": c.report()["pen"]["high"],
+                                               "graduated": False})
+    c.teach(frame(eyes, b"cat"), "cat", check=False)
+    assert "cat" not in c.report()
+
+
+def test_forget_takes_graduation_away(eyes):
+    c = make_choice(eyes, min_checks=1, gap=0, target=0.0)
+    c.check(sure("mug"), "mug")
+    assert c.graduated == {"mug"}
+    c.forget()
+    assert c.graduated == set() and c.report() == {}
+
+
+def test_the_watcher_audits_graduated_answers_at_random_moments(eyes, monkeypatch):
+    import hunch.live
+    c = make_choice(eyes, min_checks=1, gap=0, target=0.0)
+    c.check(sure("pen"), "pen")
+    looks = []
+    w = Watcher(c, lambda frame, names: looks.append(frame) or {"pen": 0.9}, rest=0, audit_every=10)
+    monkeypatch.setattr(hunch.live.random, "expovariate", lambda rate: 1 / rate)
+    x = frame(eyes, b"pen")
+    graduated = sure("pen") | {"graduated": True}
+    w.look(b"pen", x, graduated)  # the first audit is due at once
+    time.sleep(0.1)
+    for _ in range(20):
+        w.look(b"pen", x, graduated)  # the next isn't due for 10 s
+    time.sleep(0.1)
+    assert looks == [b"pen"]
+    w.audit_at["pen"] = 0
+    w.look(b"pen", x, graduated)
+    time.sleep(0.1)
+    assert looks == [b"pen", b"pen"] and c.report()["pen"]["checks"] == 3
+    assert w.describe()["graduated"] == ["pen"]
+
+
+def test_the_watcher_checks_the_answer_given_when_it_offered_the_frame(eyes):
+    c = make_choice(eyes, gap=0)
+    w = Watcher(c, lambda frame, names: {ELSE: 0.9}, rest=0)
+    w.look(b"shell", frame(eyes, b"pen"), sure("pen"))
+    time.sleep(0.1)
+    assert c.report()["pen"]["checks"] == 1 and c.report()["pen"]["agree"] == 0.0 and list(w.agree) == [False]

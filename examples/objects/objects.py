@@ -21,6 +21,9 @@ How it answers (hunch/src/hunch/live.py has the details):
                emoji from its name), and the teacher labels the frames it's sure about.
   the teacher  Clef picks one of the things or "something else". Sure of something else, it makes the page ask. It
                also says how each thing is named out loud: "that's an egg", "those are scissors", "that's rice".
+  graduation   each look of Clef's checks the student's sure answer for that frame. A thing graduates once its checks
+               agree often enough (hunch.live's rules, as the proxy's), and only then is it named for sure; before,
+               it's "I think that's a lemon". Clef audits graduated things at random moments, about every 10 s.
 
 Speech: Kokoro speaks on the CPU (82M parameters, about 0.2 s a line, downloaded once; --voice picks one, and
 "--voice browser" or no kokoro-onnx uses the browser's own voices). What you say is sent here as 16 kHz samples and
@@ -92,7 +95,8 @@ def naming(name):
     """How to say a thing out loud: Clef's phrasing once it has one, "a" or "an" before that."""
     kind = clef.phrases.get(name) if clef is not None else None
     verb, noun = PHRASES[kind] if kind else ("That's", a_or_an(name))
-    return {"sentence": f"{verb} {noun.format(name)}!", "noun": noun.format(name)}
+    return {"sentence": f"{verb} {noun.format(name)}!", "guess": f"I think {verb.lower()} {noun.format(name)}.",
+            "noun": noun.format(name)}
 
 
 def prompts_for(name):
@@ -310,7 +314,8 @@ class Handler(BaseHTTPRequestHandler):
                 album.keep(body, x, thing=things.teach(x, name), by="you")
             a = things.ask(x)
             out = {"ms": round(ms, 1), "tokens": args.tokens} | for_page(a)
-            out["say"] = naming(out["name"])["sentence"]
+            # with Clef watching, a thing is named for sure once it has graduated, and guessed at before
+            out["say"] = naming(out["name"])["sentence" if watcher is None or a["graduated"] else "guess"]
             if watcher is not None:
                 watcher.look(body, x, a)
                 said = watcher.describe()

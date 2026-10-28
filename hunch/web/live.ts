@@ -12,6 +12,12 @@
 //   Watcher   a teacher model watching the stream: it looks at the newest frame when that's worth it, one look at a
 //             time, and labels the frames it's sure about for a Choice's student.
 //
+// Answers graduate as in the Python module: a sure answer is checked when a teacher's sure look or someone's label
+// arrives for the same frame (at most one check per answer per `gap` seconds, the newest `window` kept), graduates
+// once it has `minChecks` checks whose 95% lower bound of agreement is at least `target`, and is demoted while its
+// upper bound is below it. A Watcher audits a graduated answer at random moments, on average every `auditEvery`
+// seconds.
+//
 // There is no Album: frames stay in the tab.
 
 import { load, resize, targetSize } from './eg2/model.js';
@@ -24,6 +30,7 @@ export interface Answer {
   name: string;
   p: number;
   state: State;
+  graduated: boolean;
   probs: Record<string, number>;
   zero: Record<string, number>; // 0 for an answer without prompts
   shown: number | null;
@@ -45,6 +52,13 @@ export const unit = (v: ArrayLike<number>): Vector => {
 };
 const sub = (a: ArrayLike<number>, b: ArrayLike<number>) => Float32Array.from(a, (x, i) => x - b[i]);
 const sigmoid = (z: number) => 1 / (1 + Math.exp(-Math.max(-30, Math.min(30, z))));
+/** 95% Wilson interval [low, high] for k successes in m trials. */
+export function wilson(k: number, m: number, z = 1.96): [number, number] {
+  if (m === 0) return [0, 1];
+  const p = k / m, c = (p + (z * z) / (2 * m)) / (1 + (z * z) / m);
+  const h = (z * Math.sqrt((p * (1 - p)) / m + (z * z) / (4 * m * m))) / (1 + (z * z) / m);
+  return [c - h, c + h];
+}
 function softmax(z: number[]): number[] {
   const m = Math.max(...z), e = z.map((v) => Math.exp(v - m)), s = e.reduce((a, b) => a + b, 0);
   return e.map((v) => v / s);
@@ -178,6 +192,10 @@ export interface ChoiceOptions {
   resembleScale?: number;
   halfAt?: number; // without a baseline, labelled frames at which the student and the prompts weigh the same
   perAnswer?: number; // the newest frames of each answer the student is fitted on
+  target?: number; // agreement an answer graduates at (its checks' 95% lower bound)
+  minChecks?: number;
+  window?: number; // the newest checks kept per answer
+  gap?: number; // seconds between an answer's counted checks
 }
 
 interface Labelled {
@@ -203,6 +221,9 @@ export class Choice {
   private fit: Fit | null = null;
   private baseline: Baseline | null = null;
   private residuals: Vector[] = [];
+  graduated = new Set<string>();
+  private checks = new Map<string, boolean[]>();
+  private checkedAt = new Map<string, number>();
   private generation = 0; // forget() moves it on, so a fit begun before it isn't installed after it
   private fitting = false;
   private again = false;
@@ -217,6 +238,7 @@ export class Choice {
     this.empty = opts.empty;
     this.opts = {
       temperature: 2.5, sure: 0.5, shown: 3.0, resemble: 0.6, resembleScale: 0.05, halfAt: 8, perAnswer: 60,
+      target: 0.9, minChecks: 20, window: 100, gap: 1.0,
       ...Object.fromEntries(Object.entries(opts).filter(([k]) => k !== 'quiet' && k !== 'empty')),
     } as Choice['opts'];
   }
@@ -237,12 +259,41 @@ export class Choice {
   }
 
   /** Labels frame `x` with `name` (added as an answer without prompts if it isn't one) and refits in the background;
-   * returns the answer it was labelled with. */
-  teach(x: Vector, name: string, by = 'you'): string {
+   * returns the answer it was labelled with. With `check`, the label also checks the answer given for the frame
+   * before it. */
+  teach(x: Vector, name: string, by = 'you', check = true): string {
+    const before = check ? this.ask(x) : null;
     const found = this.add(name);
     this.labelled.push({ x, i: this.names.indexOf(found), by });
     this.refit();
+    if (before) this.check(before, found);
     return found;
+  }
+
+  /** Checks the answer `ask` gave for a frame against the truth for it (an answer, or null for none of them). Returns
+   * whether they agreed, or null when the check doesn't count (not sure, or under `gap` seconds since the last). */
+  check(answer: Pick<Answer, 'name' | 'state'>, truth: string | null): boolean | null {
+    if (answer.state !== 'sure') return null;
+    const { name } = answer, now = performance.now() / 1000, o = this.opts;
+    if (now - (this.checkedAt.get(name) ?? -Infinity) < o.gap) return null;
+    this.checkedAt.set(name, now);
+    const record = [...(this.checks.get(name) ?? []), truth === name].slice(-o.window);
+    this.checks.set(name, record);
+    const [low, high] = wilson(record.filter(Boolean).length, record.length);
+    if (this.graduated.has(name)) {
+      if (high < o.target) this.graduated.delete(name);
+    } else if (record.length >= o.minChecks && low >= o.target) this.graduated.add(name);
+    return truth === name;
+  }
+
+  /** Per checked answer: its checks, their agreement and its 95% bounds, and whether it has graduated. */
+  report(): Record<string, { checks: number; agree: number; low: number; high: number; graduated: boolean }> {
+    const out: ReturnType<Choice['report']> = {};
+    for (const [name, record] of this.checks) {
+      const k = record.filter(Boolean).length, [low, high] = wilson(k, record.length);
+      out[name] = { checks: record.length, agree: k / record.length, low, high, graduated: this.graduated.has(name) };
+    }
+    return out;
   }
 
   /** Back to the answers it started with: the labelled frames go, and so do the answers added since. */
@@ -253,6 +304,9 @@ export class Choice {
     this.residuals = [];
     this.names = this.names.slice(0, this.start);
     this.prompts = this.prompts.slice(0, this.start);
+    this.checks.clear();
+    this.checkedAt.clear();
+    this.graduated.clear();
   }
 
   /** Labelled frames per answer, by who labelled them. */
@@ -338,7 +392,7 @@ export class Choice {
     const mode = student ? `taught: ${k} labelled frames, student weight ${Math.round(w * 100)}%`
       : k ? `zero-shot until two answers have frames (${k} labelled)` : 'zero-shot: text prompts only';
     const named = (v: number[]) => Object.fromEntries(names.map((name, i) => [name, v[i]]));
-    return { name: names[best], p: p[best], state, probs: named(p), zero: named(zero), shown, resemble, weight: w,
+    return { name: names[best], p: p[best], state, graduated: this.graduated.has(names[best]), probs: named(p), zero: named(zero), shown, resemble, weight: w,
              ready: baseline !== null, mode };
   }
 }
@@ -401,43 +455,50 @@ export interface WatcherOptions {
   sure?: number;
   cap?: number;
   rest?: number; // seconds
-  confirmed?: number;
   idle?: number;
   fresh?: number;
+  auditEvery?: number; // seconds, on average, between looks at a graduated answer
   onLabel?: (image: Blob, x: Vector, name: string) => void;
 }
 
 /** A teacher model watching the stream for a Choice. It looks at the newest frame when the student's answer is a
- * thing it hasn't agreed on in the last `confirmed` seconds, or, when the answer is quiet, every `idle` seconds while
- * something is being shown, resting `rest` seconds between looks. Sure of an answer, it labels the frame for the
- * student, up to `cap` frames per answer. */
+ * graduated one and its random audit is due, whenever it's one that hasn't graduated (or is unsure), or, when the
+ * answer is quiet, every `idle` seconds while something is being shown,
+ * resting `rest` seconds between looks. Sure, it checks the student's answer, and labels the frame for the student,
+ * up to `cap` frames per answer. */
 export class Watcher {
   last: { name: string; known: boolean; p: number; ms: number; at: number } | null = null;
   agree: boolean[] = [];
-  private agreed = new Map<string, number>();
   private looked: number[] = [];
-  private newest: { image: Blob; x: Vector } | null = null;
+  private newest: { image: Blob; x: Vector; answer: Answer } | null = null;
+  private auditAt = new Map<string, number>();
   private looking = false;
   readonly opts: Required<Omit<WatcherOptions, 'onLabel'>> & Pick<WatcherOptions, 'onLabel'>;
 
   constructor(readonly choice: Choice, readonly teacher: Teacher, opts: WatcherOptions = {}) {
-    this.opts = { by: 'teacher', sure: 0.5, cap: 60, rest: 0.3, confirmed: 3, idle: 3, fresh: 1.5, ...opts };
+    this.opts = { by: 'teacher', sure: 0.5, cap: 60, rest: 0.3, idle: 3, fresh: 1.5, auditEvery: 10, ...opts };
   }
 
   /** Offers the newest frame and the student's answer for it; the teacher looks if that's worth it. */
   look(image: Blob, x: Vector, answer: Answer): void {
-    const now = performance.now() / 1000, o = this.opts;
-    const worth = answer.state === 'quiet'
-      ? (answer.shown ?? 0) >= this.choice.opts.shown && now - (this.looked.at(-1) ?? -Infinity) >= o.idle
-      : now - (this.agreed.get(answer.name) ?? -Infinity) > o.confirmed;
+    const now = performance.now() / 1000, o = this.opts, name = answer.name;
+    let worth: boolean;
+    if (answer.state === 'quiet') {
+      worth = (answer.shown ?? 0) >= this.choice.opts.shown && now - (this.looked.at(-1) ?? -Infinity) >= o.idle;
+    } else if (answer.graduated) {
+      worth = now >= (this.auditAt.get(name) ?? -Infinity);
+      if (worth) this.auditAt.set(name, now - o.auditEvery * Math.log(1 - Math.random()));
+    } else {
+      worth = true;
+    }
     if (!worth) return;
-    this.newest = { image, x };
+    this.newest = { image, x, answer };
     if (!this.looking) this.watch();
   }
 
   forget(): void {
     this.agree = [];
-    this.agreed.clear();
+    this.auditAt.clear();
     this.last = null;
   }
 
@@ -445,7 +506,7 @@ export class Watcher {
     this.looking = true;
     try {
       while (this.newest) {
-        const { image, x } = this.newest, o = this.opts;
+        const { image, x, answer } = this.newest, o = this.opts;
         this.newest = null;
         this.looked = [...this.looked.slice(-199), performance.now() / 1000];
         const t0 = performance.now();
@@ -454,14 +515,13 @@ export class Watcher {
         const best = Object.keys(out).reduce((a, b) => (out[b] > out[a] ? b : a));
         const name = best === ELSE ? null : this.choice.find(best);
         this.last = { name: name ?? best, known: name !== null, p: out[best], ms, at: performance.now() / 1000 };
-        if (out[best] >= o.sure && name !== null) {
-          const agreed = this.choice.ask(x).name === name;
-          this.agree = [...this.agree.slice(-49), agreed];
-          if (agreed) this.agreed.set(name, performance.now() / 1000);
-          if ((this.choice.counts()[name]?.[o.by] ?? 0) < o.cap) {
-            this.choice.teach(x, name, o.by);
-            o.onLabel?.(image, x, name);
-          }
+        if (out[best] >= o.sure) {
+          const agreed = this.choice.check(answer, name);
+          if (agreed !== null) this.agree = [...this.agree.slice(-49), agreed];
+        }
+        if (out[best] >= o.sure && name !== null && (this.choice.counts()[name]?.[o.by] ?? 0) < o.cap) {
+          this.choice.teach(x, name, o.by, false);
+          o.onLabel?.(image, x, name);
         }
         await new Promise((r) => setTimeout(r, o.rest * 1000));
       }
@@ -482,6 +542,7 @@ export class Watcher {
     const now = performance.now() / 1000;
     return { name: l.name, known: l.known, p: l.p, ms: Math.round(l.ms), age: now - l.at, fresh: now - l.at < this.opts.fresh,
              perMinute: this.looked.filter((t) => now - t < 60).length,
-             agree: this.agree.length ? this.agree.filter(Boolean).length / this.agree.length : null, checked: this.agree.length };
+             agree: this.agree.length ? this.agree.filter(Boolean).length / this.agree.length : null, checked: this.agree.length,
+             graduated: [...this.choice.graduated].sort() };
   }
 }
