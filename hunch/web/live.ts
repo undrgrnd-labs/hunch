@@ -1,4 +1,4 @@
-// hunch.live in the browser: questions about a live stream of images (a webcam), answered from one EG2 embedding per
+// hunch.live in the browser: questions about a live stream of images (a camera), answered from one EG2 embedding per
 // frame computed on the GPU through WebGPU, and learned from the frames a person or a teacher labels as it runs.
 // The same parts as the Python module (hunch/src/hunch/live.py), and the same rules:
 //
@@ -8,7 +8,7 @@
 //             embeddings, classes weighted equally, fitted in a web worker) that answers as far as a frame
 //             resembles what it was taught, measured from the `empty` answer's frames. Answers can be added while it
 //             runs, with or without a prompt vector, and forget() goes back to the ones it started with.
-//   Detector  says yes or no: prompt vectors, plus a direction taught from one frame with the thing and one without.
+//   Detector  says yes or no: prompt vectors, plus a direction taught from one frame labelled yes and one labelled no.
 //   Watcher   a teacher model watching the stream: it looks at the newest frame when that's worth it, one look at a
 //             time, and labels the frames it's sure about for a Choice's student.
 //
@@ -183,11 +183,11 @@ function predict(fit: Fit, x: Vector): number[] {
 // ---- Choice
 
 export interface ChoiceOptions {
-  quiet?: Iterable<string>; // never named, never asked about
-  empty?: string; // the answer whose frames are the baseline
+  quiet?: Iterable<string>; // never "sure" or "unsure", so a caller doesn't act on them
+  empty?: string; // the answer whose frames are the baseline: the stream's ordinary state
   temperature?: number; // on standardised prompt similarities
   sure?: number; // an answer this likely is "sure"
-  shown?: number; // a frame this many baseline spreads from the baseline frames is showing something
+  shown?: number; // a frame this many baseline spreads from the baseline frames departs from it
   resemble?: number; // likeness to the taught frames at which the student and the prompts weigh the same
   resembleScale?: number;
   halfAt?: number; // without a baseline, labelled frames at which the student and the prompts weigh the same
@@ -404,7 +404,7 @@ export class Choice {
       const taught = new Array(n).fill(0);
       predict(student, x).forEach((v, c) => (taught[student.classes[c]] = v));
       if (!baseline) w = k / (k + opts.halfAt);
-      else { // as far as the frame looks like the things it was taught, or like the baseline
+      else { // as far as the frame looks like the frames it was taught, or like the baseline
         w = residuals.length ? sigmoid((resemble - opts.resemble) / opts.resembleScale) : 0;
         w = Math.max(w, sigmoid(2 * (opts.shown - shown!)));
       }
@@ -490,10 +490,10 @@ export interface WatcherOptions {
 
 /** A teacher model watching the stream for a Choice. It looks at the newest frame when the student's answer is a
  * graduated one and its random audit is due, whenever it's one that hasn't graduated (or is unsure), or, when the
- * answer is quiet, every `idle` seconds while something is being shown,
- * resting `rest` seconds between looks. Sure, it labels the frame for the student, up to `cap` frames per answer,
- * and checks the student's answer if it was steady: the same sure answer for the last `steady` frames offered, since
- * a thing coming into view or leaving it is named for a frame or two that show little of it. */
+ * answer is quiet, every `idle` seconds while the frame departs from the baseline (a quiet answer can be the wrong
+ * one), resting `rest` seconds between looks. Sure, it labels the frame for the student, up to `cap` frames per
+ * answer, and checks the student's answer if it was steady: the same sure answer for the last `steady` frames
+ * offered, since around a change in the stream the answer flickers on frames that show little of either side. */
 export class Watcher {
   last: { name: string; known: boolean; p: number; ms: number; at: number } | null = null;
   agree: boolean[] = [];

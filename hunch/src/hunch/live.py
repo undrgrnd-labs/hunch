@@ -1,5 +1,5 @@
-"""hunch.live: questions about a live stream (a webcam, or texts as they arrive), answered from one EG2 embedding per
-item.
+"""hunch.live: questions about a live stream (images from a camera, or texts as they arrive), answered from one EG2
+embedding per item.
 
 The proxy (`hunch.proxy`) learns typed questions about text states behind a teacher. This is the same idea for a
 stream that a person watches and teaches as it goes: every item wants an answer as it arrives, and the answers it
@@ -11,7 +11,7 @@ frame.
   Choice    picks one answer. Every answer has text prompts, so it answers zero-shot from the start; labelled
             frames train a student, which answers as far as a frame resembles what it was taught. Answers can be
             added while it runs, and `forget` goes back to the ones it started with.
-  Detector  says yes or no: text prompts, plus a direction taught from one frame with the thing and one without.
+  Detector  says yes or no: text prompts, plus a direction taught from one frame labelled yes and one labelled no.
   Watcher   a teacher model watching the stream: it looks at the newest frame when that's worth it, one look at a
             time, and labels the frames it's sure about for a Choice's student.
   Album     labelled frames on disk (the image or text, its embedding, labels.jsonl), to teach again after a restart.
@@ -19,17 +19,18 @@ frame.
 How a Choice answers:
   zero-shot  a frame scores each answer by its mean similarity to the answer's prompts, standardised across the
              answers; a softmax at `temperature` makes those probabilities.
-  baseline   frames labelled with the `empty` answer (empty hands, nothing to show) are the baseline: a frame's
-             distance from them, in their own spreads, says whether anything is being shown (`shown`), and what
-             differs from them, compared with the same for every taught frame, says how much the frame resembles
-             what was taught (`resemble`, the best cosine).
+  baseline   frames labelled with the `empty` answer (the stream's ordinary state, where there is nothing to
+             answer) are the baseline: a frame's distance from them, in their own spreads, says how far it departs
+             from that state (`shown`), and what differs from them, compared with the same for every taught frame,
+             says how much the frame resembles what was taught (`resemble`, the best cosine).
   taught     a logistic regression on the labelled frames (standardised, classes weighted equally), refitted in the
              background. With a baseline, its weight is a sigmoid of the resemblance (half at `resemble`), and full
              when the frame is as close to the baseline as the baseline frames are to each other; without one, it
              grows with the labelled frames (half at `half_at`). Answers never taught keep their zero-shot share of
              what the student leaves.
   state      "quiet" when the best answer is a quiet one (never named), "sure" when it's at least `sure` likely,
-             else "unsure" if something is being shown (or there's no baseline to tell) and "quiet" if not.
+             else "unsure" if the frame departs from the baseline (or there's no baseline to tell) and "quiet" if
+             not. A quiet answer is one a caller doesn't act on: the `empty` answer, and any others in `quiet`.
 
 How an answer graduates (as the proxy's questions do, but per answer, since answers grow while it runs):
   checks     a sure answer is checked when the truth for the same frame arrives: a teacher's sure look (a Watcher's)
@@ -42,7 +43,8 @@ How an answer graduates (as the proxy's questions do, but per answer, since answ
              checks sample the stream rather than moments it chose; an answer that hasn't graduated it looks at
              whenever it can.
   Without a teacher, only the labels someone gives check the answers, so graduation is slow and rare; the answers
-  are the same either way, and `graduated` is for the caller to act on (to say a thing out loud, say).
+  are the same either way, and `graduated` is for the caller to act on (before acting on an answer without asking,
+  say).
 """
 
 from __future__ import annotations
@@ -129,8 +131,8 @@ class _Fit:
 class Choice:
     """Picks one answer from text prompts and labelled frames; see the module's docstring for how.
 
-    `answers` maps each answer to its prompts. `quiet` answers are never named and never asked about; `empty` is the
-    one whose frames are the baseline. `new(name)` gives prompts for a name taught that isn't an answer yet (without
+    `answers` maps each answer to its prompts. `quiet` answers are never "sure" or "unsure", so a caller doesn't act
+    on them; `empty` is the one whose frames are the baseline. `new(name)` gives prompts for a name taught that isn't an answer yet (without
     it, teaching an unknown name is an error)."""
 
     def __init__(self, eyes: Eyes, answers: dict[str, list[str]], *, quiet=(), empty: str | None = None,
@@ -312,7 +314,7 @@ class Choice:
             taught[student.classes_] = student.predict_proba(x[None])[0]
             if baseline is None:
                 w = k / (k + self.half_at)
-            else:  # as far as the frame looks like the things it was taught, or like the baseline
+            else:  # as far as the frame looks like the frames it was taught, or like the baseline
                 w = sigmoid((resemble - self.resemble) / self.resemble_scale) if fit.residuals is not None else 0.0
                 w = max(w, sigmoid(2 * (self.shown - shown)))
             p = (1 - w) * zero + w * taught
@@ -321,7 +323,7 @@ class Choice:
             state = "quiet"
         elif p[best] >= self.sure:
             state = "sure"
-        else:  # no answer stands out: worth asking about only if something is being shown
+        else:  # no answer stands out: worth asking about only if the frame departs from the baseline
             state = "unsure" if shown is None or shown >= self.shown else "quiet"
         if student is not None:
             mode = f"taught: {k} labelled frames, student weight {w:.0%}"
@@ -389,11 +391,12 @@ class Watcher:
 
     It looks at the newest frame when the student's answer is a graduated one and its random audit is due (on average
     every `audit_every` seconds), whenever it's one that hasn't graduated (or is unsure), or, when the answer is
-    quiet, every `idle` seconds while something is being shown (a held thing can read as a bare hand), resting `rest`
-    seconds between looks. Sure (`sure`), it labels the frame for the student, up to `cap` frames per answer, calling
+    quiet, every `idle` seconds while the frame departs from the baseline (a quiet answer can be the wrong one),
+    resting `rest` seconds between looks. Sure (`sure`), it labels the frame for the student, up to `cap` frames per answer, calling
     `on_label(frame, x, name)`, and checks the student's answer (`Choice.check`) if it was steady: the same sure
-    answer for the last `steady` frames offered. A thing coming into view or leaving it is named for a frame or two
-    that show little of it; what a caller says out loud waits for a steady answer, and so do the checks."""
+    answer for the last `steady` frames offered. Around a change in the stream, the student's answer flickers for a
+    frame or two on frames that show little of either side; a caller acting on answers waits for a steady one, and so
+    do the checks."""
 
     def __init__(self, choice: Choice, teacher: Callable[[Frame, list[str]], dict[str, float]], *, by: str = "teacher",
                  sure: float = 0.5, cap: int = 60, rest: float = 0.3, idle: float = 3.0,
