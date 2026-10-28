@@ -8,20 +8,24 @@ each example, keyed by hashes, so every comparison replays without running it.
 
 ## Setup
 
-You need a Rust toolchain, because `uv sync` builds eg2cpu from `../eg2cpu`. You also need the EmbeddingGemma 2
-checkpoint, which is Apache-2.0 and not gated on the Hub (as of October 2026).
+You need a Rust toolchain (1.88 or later), because `uv sync` builds eg2cpu from `../eg2cpu` (about a minute the first
+time), and [uv](https://docs.astral.sh/uv/), which also fetches Python 3.12. Every example needs the EmbeddingGemma 2
+checkpoint (1.4 GB), which is Apache-2.0 and not gated on the Hub (as of October 2026). Run every command here from
+`examples/`.
 
 ```bash
 cd examples
 uv sync
 uv run download.py                  # what's available and what's already here
-uv run download.py embeddinggemma-2 sst5 InjecAgent   # asks before each download (--yes to skip the question)
+uv run download.py embeddinggemma-2 sst5 InjecAgent   # asks before each download (--yes to skip the question, and
+                                                      # without a terminal to answer in)
 ```
 
 Datasets go to `data/hf/` (git-ignored), or to `EG2_DATA` if you set it. Results go to `results/` (git-ignored): each
 example's own files, its `<example>_teacher.json` comparison, and caches of rebuilt rows and embeddings. The
-model goes to the Hugging Face cache, or to `EG2_MODEL_DIR`. Every download is pinned to the revision the shipped
-hashes refer to.
+model goes to the Hugging Face cache (`HF_HOME`, default `~/.cache/huggingface`); `EG2_MODEL_DIR` points eg2cpu at a
+checkpoint you keep somewhere else instead (`download.py` doesn't write there). Every download is pinned to the
+revision the shipped hashes refer to.
 
 | dataset | size | licence |
 |---|---|---|

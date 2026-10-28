@@ -4,6 +4,8 @@ Builds the stream the proxy examples replay and asks a teacher about every item:
 order, each answered once on the three stream questions (`hunch_examples.STREAM_QUESTIONS`: `tool_failed`,
 `output_kind`, `severity`).
 
+From `examples/`:
+
 ```bash
 TEACHER_URL=http://localhost:8000/v1/answer uv run teacher_stream/teacher_stream.py
 ```

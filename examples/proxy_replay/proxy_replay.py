@@ -43,6 +43,11 @@ QS = ["tool_failed", "output_kind", "severity"]
 WARMUP, REFIT, AUDIT_WINDOW = 150, 100, 40
 MINORITY_TARGET, MINORITY_MIN = 0.80, 15  # graduation also needs recall on the teacher's non-majority answers
 
+
+def agree_cells(agreements):
+    """Agreement columns: a dash where nothing was answered locally (no local answers to agree with)."""
+    return [f"{x:>22.3f}" if x == x else f"{'-':>22}" for x in agreements]
+
 rows = stream_rows()  # the teacher's answers from data/teacher_stream.jsonl
 n = len(rows)
 
@@ -217,12 +222,12 @@ def report(served, called, local_ans, events, label, windows=True):
     for i, q, what, t in events:
         print(f"   item {i:>5}: {q} {what}" + (f" (threshold {t:.2f})" if t is not None else ""))
     if windows:
-        print(f"   {'items':>11}{'served locally':>16}{'teacher calls/item':>17}" + "".join(f"{'agree ' + q:>22}" for q in QS))
+        print(f"   {'items':>11}{'served locally':>16}{'teacher calls/item':>20}" + "".join(f"{'agree ' + q:>22}" for q in QS))
         for a in range(0, n, 250):
             b = min(n, a + 250)
             s = served[a:b]
             ag = [np.mean(local_ans[q][a:b][s] == Y[q][a:b][s]) if s.any() else float("nan") for q in QS]
-            print(f"   {a:>5}-{b:<5}{s.mean():>16.0%}{called[a:b].mean():>17.2f}" + "".join(f"{x:>22.3f}" for x in ag))
+            print(f"   {a:>5}-{b:<5}{s.mean():>16.0%}{called[a:b].mean():>20.2f}" + "".join(agree_cells(ag)))
     half = slice(n // 2, n)
     s = served[half]
     out = {"served_local_second_half": float(s.mean()), "teacher_calls_per_item_second_half": float(called[half].mean()),
@@ -275,7 +280,8 @@ for q_only in QS_FULL:
 QS = QS_FULL
 
 print("\n== sensitivity (second half of the stream; all three questions)")
-print(f"   {'target':>7}{'audit':>7}{'served locally':>16}{'teacher calls/item':>17}" + "".join(f"{'agree ' + q:>22}" for q in QS))
+print("   (agreement is over the answers served locally; - where none were)")
+print(f"   {'target':>7}{'audit':>7}{'served locally':>16}{'teacher calls/item':>20}" + "".join(f"{'agree ' + q:>22}" for q in QS))
 sens = []
 for target in (0.85, 0.90, 0.95):
     for audit in (0.05, 0.10):
@@ -285,7 +291,7 @@ for target in (0.85, 0.90, 0.95):
         ag = [float(np.mean(la[q][half][s] == Y[q][half][s])) if s.any() else float("nan") for q in QS]
         sens.append({"target": target, "audit": audit, "served_local": float(s.mean()), "teacher_calls": float(called[half].mean()),
                      "agreement": dict(zip(QS, ag))})
-        print(f"   {target:>7.2f}{audit:>7.0%}{s.mean():>16.0%}{called[half].mean():>17.2f}" + "".join(f"{x:>22.3f}" for x in ag))
+        print(f"   {target:>7.2f}{audit:>7.0%}{s.mean():>16.0%}{called[half].mean():>20.2f}" + "".join(agree_cells(ag)))
 results["sensitivity"] = sens
 
 for key in ("main (target 0.90, audit 10%)", "without severity"):

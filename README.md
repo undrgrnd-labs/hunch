@@ -125,8 +125,9 @@ uv sync --all-packages
 
 The proxy's tests don't need the model; running hunch, the examples and eg2cpu's tests do. The model is
 `google/embeddinggemma-2`, Apache-2.0 and not gated on Hugging Face (as of October 2026), so no login is needed:
-`cd examples && uv run download.py embeddinggemma-2`. It goes to the Hugging Face cache; to use another folder, set
-`EG2_MODEL_DIR`.
+`cd examples && uv run download.py embeddinggemma-2` (1.4 GB; add `--yes` when there's no terminal to answer its
+question). It goes to the Hugging Face cache (`HF_HOME`, default `~/.cache/huggingface`). To keep the checkpoint
+somewhere else, put it there yourself and set `EG2_MODEL_DIR` to that folder; eg2cpu then reads it from there.
 
 ## Tests
 

@@ -155,7 +155,8 @@ def resolve_pi(states: set[str]) -> dict[str, dict]:
     found = {r["state"]: r for r in load_jsonl(cache_file)} if cache_file.exists() else {}
     todo = set(states) - set(found)
     if todo:
-        print(f"   finding {len(todo)} pi tool results in the downloaded traces", flush=True)
+        print(f"   finding {len(todo)} distinct pi tool results in the downloaded traces (once: they're cached in "
+              f"{cache_file.relative_to(EX)})", flush=True)
         new = []
         for r in pi_tool_results():
             c2, _, o2 = clip(f"{r.call}\n{r.text}").partition("\n")

@@ -135,6 +135,8 @@ The loop this pilot runs by hand:
 
 ## Reproduce
 
+From `examples/`:
+
 ```bash
 uv run question_pilot/question_pilot.py mine injection
 ```

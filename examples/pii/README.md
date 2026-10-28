@@ -7,11 +7,13 @@ eg2cpu returns mean-pooled readouts, not per-token states, so this asks *whether
 
 *60 held-out gretel windows (document types the decision never saw) through `contains_pii`, live on the CPU: each answer appears after the time it took (median 35 ms) and holds for 100 ms*
 
+From `examples/`:
+
 ```bash
 uv run pii/pii.py
 ```
 
-**Needs:** gretel (`download.py`). **Writes:** `results/pii_probe.json` and the compiled
+**Needs:** EmbeddingGemma 2 (see [Setup](../README.md#setup)), gretel (`download.py`). **Writes:** `results/pii_probe.json` and the compiled
 `results/contains_pii.{yaml,eg2h}`. **Time:** about 4 minutes.
 
 **Teacher answers:** [`teacher.jsonl`](teacher.jsonl), from Clef: question hash, state hash and answer; no text.

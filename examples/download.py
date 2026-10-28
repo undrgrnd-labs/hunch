@@ -4,11 +4,14 @@
     uv run download.py sst5 injecagent # download these (asks first; --yes to skip the question)
     uv run download.py all
 
-Datasets go to $EG2_DATA (default examples/data/hf). The model goes to the Hugging Face cache, where eg2cpu.Model()
-looks for it (or set $EG2_MODEL_DIR). Licences differ per dataset; read them before using the data for anything else.
+Datasets go to $EG2_DATA (default examples/data/hf). The model goes to the Hugging Face cache ($HF_HOME, default
+~/.cache/huggingface), where eg2cpu.Model() looks for it. $EG2_MODEL_DIR is for a checkpoint kept elsewhere: eg2cpu
+reads it from there instead, and this script doesn't write to it. Licences differ per dataset; read them before using
+the data for anything else. Without a terminal to answer in, pass --yes.
 """
 
 import argparse
+import os
 import sys
 import urllib.request
 
@@ -85,6 +88,8 @@ def main() -> None:
     ap.add_argument("names", nargs="*", help=f"any of: {', '.join(DATASETS)}, or 'all'")
     ap.add_argument("--yes", action="store_true", help="don't ask before each download")
     args = ap.parse_args()
+    if not sys.stdout.isatty():  # one progress bar per file floods a log
+        os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
     if not args.names:
         print(f"data dir: {HF}\n")
         for name, (repo, _, size, lic) in DATASETS.items():
@@ -108,7 +113,7 @@ def main() -> None:
             except EOFError:
                 ok = False
             if not ok:
-                print("  skipped")
+                print("  skipped" + ("" if sys.stdin.isatty() else " (no terminal to answer in: pass --yes)"))
                 continue
         download(name)
 

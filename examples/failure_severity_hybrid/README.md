@@ -5,11 +5,13 @@ one is graded minor, recoverable or blocking by
 [`../decisions/failure_severity_graded.yaml`](../decisions/failure_severity_graded.yaml). Compared with single
 handles over 5 random calibration and test splits.
 
+From `examples/`:
+
 ```bash
 uv run failure_severity_hybrid/failure_severity_hybrid.py
 ```
 
-**Needs:** the pi traces (the labels ship as hashes; the text is rebuilt from the download). **Writes:** `results/failure_severity_hybrid.json`. **Time:** about 3 minutes.
+**Needs:** EmbeddingGemma 2 (see [Setup](../README.md#setup)), the pi traces (the labels ship as hashes; the text is rebuilt from the download). **Writes:** `results/failure_severity_hybrid.json`. **Time:** about 3 minutes.
 
 **Teacher answers:** [`teacher.jsonl`](teacher.jsonl), from Clef: question hash, state hash and answer; no text.
 

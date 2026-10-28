@@ -13,7 +13,7 @@ TEACHER_URL=... uv run proxy_service/proxy_service.py --live    # ask a live tea
 
 A live teacher must speak hunch's teacher protocol ([../../hunch/README.md](../../hunch/README.md#the-teacher)).
 
-**Needs:** the pi traces, public coding-agent sessions (`uv run download.py real-pi-coding-agent-traces-sessions`;
+**Needs:** EmbeddingGemma 2 (see [Setup](../README.md#setup)), the pi traces, public coding-agent sessions (`uv run download.py real-pi-coding-agent-traces-sessions`;
 the stream ships as hashes, and its text is rebuilt from the download). **Writes:** `results/proxy_service.{json,db}`.
 **Time:** about 1 minute.
 

@@ -2,11 +2,13 @@
 
 `kind: levels` on SST-5, five levels of sentence sentiment from very negative to very positive.
 
+From `examples/`:
+
 ```bash
 uv run levels_sst5/levels_sst5.py
 ```
 
-**Needs:** sst5 (`download.py`). **Writes:** `results/levels_sst5.json`. **Time:** about 1 minute.
+**Needs:** EmbeddingGemma 2 (see [Setup](../README.md#setup)), sst5 (`download.py`). **Writes:** `results/levels_sst5.json`. **Time:** about 1 minute.
 
 **Teacher answers:** [`teacher.jsonl`](teacher.jsonl), from Clef: question hash, state hash and answer; no text.
 

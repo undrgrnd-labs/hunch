@@ -11,11 +11,12 @@ uv run tool_call_failed/tool_call_failed.py   # first: compiles the handle the w
 uv run proxy_replay/proxy_replay.py
 ```
 
-**Needs:** the pi traces, public coding-agent sessions (`uv run download.py real-pi-coding-agent-traces-sessions`;
+**Needs:** EmbeddingGemma 2 (see [Setup](../README.md#setup)), the pi traces, public coding-agent sessions (`uv run download.py real-pi-coding-agent-traces-sessions`;
 the stream, [`../data/pi_stream.jsonl`](../data/pi_stream.jsonl), ships as hashes, and the teacher's answers are in
 [`../data/teacher_stream.jsonl`](../data/teacher_stream.jsonl)). Without `results/tool_call_failed.eg2h`, the script
-writes its main results and stops before the warm-start section. **Writes:** `results/proxy_replay.json`.
-**Time:** about 3 minutes.
+writes its main results and stops before the warm-start section; `tool_call_failed`, which writes it, also needs
+tau2 (`uv run download.py tau2-bench-trajectories`). **Writes:** `results/proxy_replay.json`. **Time:** about 3
+minutes, plus 3 for `tool_call_failed`.
 
 ## What it does
 

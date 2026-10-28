@@ -4,12 +4,14 @@ Can the teacher detect indirect prompt injection in tool outputs, and what happe
 This is rule 9 of [`../../docs/question-design.md`](../../docs/question-design.md): check the teacher against ground
 truth before distilling it.
 
+From `examples/`:
+
 ```bash
 uv run injection_teacher/injection_teacher.py
 uv run preflight/preflight.py results/injection_teacher_truth.jsonl --type noul --name injection
 ```
 
-**Needs:** InjecAgent and the pi traces (`download.py`); the 700 units are built from them on first use
+**Needs:** EmbeddingGemma 2 (see [Setup](../README.md#setup)), InjecAgent and the pi traces (`download.py`); the 700 units are built from them on first use
 (`hunch_examples.injection_units`). **Writes:** `results/injection_teacher_{answers,truth}.jsonl`, the two
 answer files `preflight` reads. **Time:** about 15 seconds.
 

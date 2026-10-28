@@ -174,6 +174,9 @@ struct Layer {
     scalar: f32,
 }
 
+const GET_IT: &str = "download it with `uv run download.py embeddinggemma-2` (from examples/), or set EG2_MODEL_DIR \
+                      to a folder holding config.json, tokenizer.json and model.safetensors";
+
 /// `$EG2_MODEL_DIR`, else the Hugging Face cache snapshot of google/embeddinggemma-2.
 pub fn default_model_dir() -> Result<PathBuf> {
     if let Ok(d) = std::env::var("EG2_MODEL_DIR") {
@@ -187,10 +190,10 @@ pub fn default_model_dir() -> Result<PathBuf> {
     });
     let snaps = hub.join("models--google--embeddinggemma-2/snapshots");
     std::fs::read_dir(&snaps)
-        .with_context(|| format!("no model at {} (set EG2_MODEL_DIR)", snaps.display()))?
+        .with_context(|| format!("no EmbeddingGemma 2 in the Hugging Face cache ({}): {GET_IT}", snaps.display()))?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .find(|p| p.join("model.safetensors").exists())
-        .ok_or_else(|| anyhow!("no snapshot with model.safetensors under {}", snaps.display()))
+        .ok_or_else(|| anyhow!("no snapshot with model.safetensors under {}: {GET_IT}", snaps.display()))
 }
 
 impl Model {
@@ -199,6 +202,12 @@ impl Model {
     }
 
     pub fn load(dir: &Path) -> Result<Self> {
+        for f in ["config.json", "tokenizer.json", "model.safetensors"] {
+            if !dir.join(f).is_file() {
+                let from = if std::env::var_os("EG2_MODEL_DIR").is_some() { " (EG2_MODEL_DIR)" } else { "" };
+                return Err(anyhow!("no EmbeddingGemma 2 checkpoint in {}{from}: {f} is missing; {GET_IT}", dir.display()));
+            }
+        }
         let json: Value = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
         let cfg = Config::from_json(&json)?;
         let vision_cfg = VisionConfig::from_json(&json)?;

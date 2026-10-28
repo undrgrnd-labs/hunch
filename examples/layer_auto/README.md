@@ -5,11 +5,13 @@ data; then `readout.layer: auto` runs without seeing that data, using grouped cr
 (with and without contrast groups) and, for `contains_pii`, a small transfer set. It passes if it lands on the best
 layer or on one whose AUC is not significantly lower (a paired bootstrap interval that includes zero).
 
+From `examples/`:
+
 ```bash
 uv run layer_auto/layer_auto.py
 ```
 
-**Needs:** the pi traces and gretel (`download.py`). **Writes:** `results/layer_auto.json`. **Time:**
+**Needs:** EmbeddingGemma 2 (see [Setup](../README.md#setup)), the pi traces and gretel (`download.py`). **Writes:** `results/layer_auto.json`. **Time:**
 about 6 minutes.
 
 **Teacher answers:** [`teacher.jsonl`](teacher.jsonl), from Clef: question hash, state hash and answer; no text.

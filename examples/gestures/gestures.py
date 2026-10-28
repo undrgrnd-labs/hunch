@@ -3,7 +3,7 @@ questions pick one answer (what's the hand doing? what's the face showing?), eac
 `hunch.live.Detector`s say yes or no (fire? a cat? your thing?). Text prompts answer zero-shot, and frames you label
 teach each question as it goes.
 
-    uv run gestures/gestures.py            # then open http://localhost:8765 and allow the camera
+    uv run gestures/gestures.py            # from examples/; then open http://localhost:8765 and allow the camera
     uv run gestures/gestures.py --tokens 140   # sharper (smaller hands, farther away) at about half the frame rate
 
 How a question that picks one answer answers (hunch/src/hunch/live.py has the details):
@@ -29,6 +29,7 @@ labels aside as labels.<time>.jsonl.
 
 import argparse
 import json
+import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -68,6 +69,10 @@ ap = argparse.ArgumentParser()
 ap.add_argument("--port", type=int, default=8765)
 ap.add_argument("--tokens", type=int, default=70, help="soft tokens per frame (70, 140, 280)")
 args = ap.parse_args()
+try:  # the port first, so a taken one fails before the model loads
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), None)
+except OSError as e:
+    sys.exit(f"can't listen on port {args.port} ({e.strerror}): pass --port to use another")
 
 eyes = Eyes(tokens=args.tokens)
 
@@ -182,4 +187,5 @@ if kept:
     print(f"taught again from {len(kept)} saved frames", flush=True)
 eyes.warm()
 print(f"gestures: http://localhost:{args.port}  ({args.tokens} soft tokens per frame)", flush=True)
-ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
+server.RequestHandlerClass = Handler
+server.serve_forever()

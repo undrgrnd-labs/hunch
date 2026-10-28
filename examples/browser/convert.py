@@ -15,10 +15,27 @@ import sys
 
 import numpy as np
 
-SRC = glob.glob(os.path.expanduser(
-    "~/.cache/huggingface/hub/models--google--embeddinggemma-2/snapshots/*/model.safetensors"))[0]
+
+
+def checkpoint():
+    """model.safetensors where eg2cpu looks: $EG2_MODEL_DIR, else the Hugging Face cache ($HF_HUB_CACHE, or
+    $HF_HOME/hub, default ~/.cache/huggingface/hub)."""
+    if os.environ.get("EG2_MODEL_DIR"):
+        found = glob.glob(os.path.join(os.environ["EG2_MODEL_DIR"], "model.safetensors"))
+    else:
+        hub = os.environ.get("HF_HUB_CACHE") or os.path.join(
+            os.environ.get("HF_HOME") or os.path.expanduser("~/.cache/huggingface"), "hub")
+        found = glob.glob(os.path.join(hub, "models--google--embeddinggemma-2/snapshots/*/model.safetensors"))
+    if not found:
+        sys.exit("no EmbeddingGemma 2 checkpoint found: download it with `uv run download.py embeddinggemma-2` "
+                 "(from examples/), or set EG2_MODEL_DIR to a folder holding model.safetensors and config.json")
+    return found[0]
+
+
+SRC = checkpoint()
 CFG = json.load(open(os.path.join(os.path.dirname(SRC), "config.json")))
 OUT = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights")
+os.makedirs(OUT, exist_ok=True)
 POS_ROWS = 840  # largest patch-grid side at a 280 soft-token budget (2520 patches)
 
 f = open(SRC, "rb")

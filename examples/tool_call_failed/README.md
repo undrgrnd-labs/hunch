@@ -4,11 +4,13 @@ Does the compiled `tool_call_failed` decision ([`../decisions/tool_call_failed.y
 56 synthetic contrast pairs and 4 hard negatives) work on real coding-agent tool results, and does it abstain on a
 domain it wasn't built for?
 
+From `examples/`:
+
 ```bash
 uv run tool_call_failed/tool_call_failed.py
 ```
 
-**Needs:** the pi traces and tau2 (`download.py`). **Writes:** `results/tool_call_failed.eg2h`, which `proxy_replay`
+**Needs:** EmbeddingGemma 2 (see [Setup](../README.md#setup)), the pi traces and tau2 (`download.py`). **Writes:** `results/tool_call_failed.eg2h`, which `proxy_replay`
 and `failure_severity` read. **Time:** about 3 minutes.
 
 **Teacher answers:** [`teacher.jsonl`](teacher.jsonl), from Clef: question hash, state hash and answer; no text.

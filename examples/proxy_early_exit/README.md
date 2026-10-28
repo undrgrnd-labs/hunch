@@ -2,11 +2,13 @@
 
 Which encoder layers do the proxy's students need, and can easy items stop at an early layer?
 
+From `examples/`:
+
 ```bash
 uv run proxy_early_exit/proxy_early_exit.py
 ```
 
-**Needs:** the pi traces (the stream ships as hashes). Encoder cost per item comes from
+**Needs:** EmbeddingGemma 2 (see [Setup](../README.md#setup)), the pi traces (the stream ships as hashes). Encoder cost per item comes from
 [`early_exit_timing.json`](early_exit_timing.json): eg2cpu's batched exits after layers 4, 8 and 12, the full pass,
 and resuming from layer 8. **Writes:** `results/proxy_early_exit.json`. **Time:** about 1 minute.
 

@@ -3,14 +3,19 @@
 EmbeddingGemma 2's image path, hand-written in WGSL, runs a webcam object namer entirely in the browser: the camera,
 the embedding, the student and the voice all stay in the tab, and nothing is installed.
 
+From the repository's root, after the [setup](../README.md#setup) (which downloads the checkpoint):
+
 ```bash
 uv run examples/browser/convert.py          # the image path's weights -> examples/browser/weights/ (580 MB, once)
-python3 -m http.server 8803 --bind 127.0.0.1    # from the repository's root
+python3 -m http.server 8803 --bind 127.0.0.1
 # open http://localhost:8803/examples/browser/ in Chrome, press Start, allow the camera
 ```
 
-**Needs:** the EmbeddingGemma 2 checkpoint in the Hugging Face cache (`download.py`), and a browser with WebGPU
-(tested in Chrome 156 on Apple silicon). **Ships:** `things.json`, the prompt vectors below; the weights don't ship.
+**Needs:** the EmbeddingGemma 2 checkpoint (`convert.py` finds it where eg2cpu does: `EG2_MODEL_DIR`, else the Hugging
+Face cache), a browser with WebGPU (tested in Chrome 156 on Apple silicon), and a webcam; browsers allow the camera on
+`http://localhost` but not on other plain-HTTP addresses. **Ships:** `things.json`, the prompt vectors below, and
+hunch.live's bundle (`hunch/web/dist/live.js`), so nothing needs building; the weights don't ship. The page fetches
+the 580 MB of weights from the server each time it loads.
 
 ## What it does
 

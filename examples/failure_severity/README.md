@@ -3,11 +3,13 @@
 Can a `kind: levels` decision ([`../decisions/failure_severity.yaml`](../decisions/failure_severity.yaml)) grade
 coding-agent tool results as none, minor, recoverable or blocking?
 
+From `examples/`:
+
 ```bash
 uv run failure_severity/failure_severity.py
 ```
 
-**Needs:** the pi traces (the labels ship as hashes; the text is rebuilt from the download), plus
+**Needs:** EmbeddingGemma 2 (see [Setup](../README.md#setup)), the pi traces (the labels ship as hashes; the text is rebuilt from the download), plus
 `results/tool_call_failed.eg2h` from `tool_call_failed` for one baseline.
 **Writes:** `results/failure_severity_validation.json`. **Time:** about 1 minute.
 

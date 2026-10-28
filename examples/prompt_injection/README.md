@@ -7,11 +7,13 @@ on tools and attacks it has never seen?
 
 *60 held-out InjecAgent tool outputs (unseen tools and attacks, with benign twins) through `injection_in_tool_output`, live on the CPU: each answer appears after the time it took (median 49 ms) and holds for 100 ms*
 
+From `examples/`:
+
 ```bash
 uv run prompt_injection/prompt_injection.py
 ```
 
-**Needs:** InjecAgent and the pi traces (`download.py`). **Writes:** `results/prompt_injection.json` and the compiled
+**Needs:** EmbeddingGemma 2 (see [Setup](../README.md#setup)), InjecAgent and the pi traces (`download.py`). **Writes:** `results/prompt_injection.json` and the compiled
 `results/injection_in_tool_output.{yaml,eg2h}`. **Time:** about 3 minutes.
 
 **Teacher answers:** [`teacher.jsonl`](teacher.jsonl), from Clef: question hash, state hash and answer; no text.

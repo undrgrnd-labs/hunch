@@ -4,11 +4,11 @@ the thing from the next two seconds of frames. With --teacher, Clef watches too 
 model, local on the GPU or from OpenRouter, that answers in under a second, labels the frames it's sure about for the
 student, and says when it sees something that isn't any of the known things.
 
-    uv run --with faster-whisper --with kokoro-onnx examples/objects/objects.py   # then open http://localhost:8766
+    uv run --with faster-whisper --with kokoro-onnx objects/objects.py   # from examples/; then open http://localhost:8766
     uv run --with faster-whisper --with kokoro-onnx --with "mlx-vlm>=0.7.4,<0.8" --with pillow \\
-        examples/objects/objects.py --teacher path/to/clef-flash-4bit        # Clef as the teacher (Apple silicon)
+        objects/objects.py --teacher path/to/clef-flash-4bit        # Clef as the teacher (Apple silicon)
     OPENROUTER_API_KEY=... uv run --with faster-whisper --with kokoro-onnx \\
-        examples/objects/objects.py --teacher openrouter:cloudflare/clef-flash   # Clef from OpenRouter
+        objects/objects.py --teacher openrouter:cloudflare/clef-flash   # Clef from OpenRouter
     ... --tokens 140                                              # smaller things, about half the frame rate
 
 How it answers (hunch/src/hunch/live.py has the details):
@@ -26,8 +26,9 @@ How it answers (hunch/src/hunch/live.py has the details):
                agree often enough (hunch.live's rules, as the proxy's), and only then is it named for sure; before,
                it's "I think that's a lemon". Clef audits graduated things at random moments, about every 10 s.
 
-Speech: Kokoro speaks on the CPU (82M parameters, about 0.2 s a line, downloaded once; --voice picks one, and
-"--voice browser" or no kokoro-onnx uses the browser's own voices). What you say is sent here as 16 kHz samples and
+Speech: Kokoro speaks on the CPU (82M parameters, about 0.2 s a line; its 90 MB of files are downloaded once to
+~/.cache/hunch/kokoro). --voice picks a voice; "--voice browser", no kokoro-onnx, or a Kokoro that fails its first line
+at start uses the browser's own voices. What you say is sent here as 16 kHz samples and
 transcribed by faster-whisper on the CPU (small.en, downloaded once, told the names of the things it knows). Hold
 space to talk at any time ("that's a lemon"); Enter types a name instead.
 
@@ -42,6 +43,7 @@ import json
 import os
 import re
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -81,6 +83,10 @@ ap.add_argument("--voice", default="af_heart", help="a Kokoro voice (af_heart, a
 ap.add_argument("--teacher", help="Clef, to teach the student as it watches: a local MLX model directory "
                                    "(clef-flash-4bit), or openrouter:cloudflare/clef-flash (OPENROUTER_API_KEY)")
 args = ap.parse_args()
+try:  # the port first, so a taken one fails before the model loads
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), None)
+except OSError as e:
+    sys.exit(f"can't listen on port {args.port} ({e.strerror}): pass --port to use another")
 
 eyes = Eyes(tokens=args.tokens)
 
@@ -235,9 +241,13 @@ class Ears:
 
 
 class Voice:
-    """Kokoro on the CPU, its model downloaded on first start; each line is made once and kept."""
+    """Kokoro on the CPU, its model downloaded on first start; each line is made once and kept. Its first line is made
+    in a separate process: espeak-ng, under Kokoro, ends the process when it can't find its data (as when its install
+    path is long), and a server should fall back to the browser's voices rather than go down with it."""
 
     FILES = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/"
+    TRY = ("import sys; from kokoro_onnx import Kokoro; "
+           "Kokoro(sys.argv[1], sys.argv[2]).create('Hello.', voice=sys.argv[3], lang='en-us')")
 
     def __init__(self, name, home):
         from kokoro_onnx import Kokoro
@@ -247,7 +257,11 @@ class Voice:
                 print(f"downloading {f}", flush=True)
                 urllib.request.urlretrieve(self.FILES + f, home / f".{f}")
                 (home / f".{f}").rename(home / f)
-        self.kokoro = Kokoro(str(home / "kokoro-v1.0.int8.onnx"), str(home / "voices-v1.0.bin"))
+        model, voices = str(home / "kokoro-v1.0.int8.onnx"), str(home / "voices-v1.0.bin")
+        tried = subprocess.run([sys.executable, "-c", self.TRY, model, voices, name], capture_output=True, text=True)
+        if tried.returncode:
+            raise RuntimeError((tried.stderr.strip().splitlines() or [f"exit {tried.returncode}"])[-1])
+        self.kokoro = Kokoro(model, voices)
         self.name = name
         self.lines = {}
         self.busy = threading.Lock()
@@ -267,10 +281,12 @@ def voice_for(name):
     if name == "browser":
         return None
     try:
-        return Voice(name, FRAMES / "kokoro")
+        return Voice(name, Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "hunch" / "kokoro")
     except ImportError:
         print("kokoro-onnx isn't installed: the browser's voices will speak", flush=True)
-        return None
+    except RuntimeError as e:
+        print(f"Kokoro can't speak here ({e}): the browser's voices will speak", flush=True)
+    return None
 
 
 def emoji_of(name):
@@ -378,4 +394,5 @@ watcher = Watcher(things, clef, by="clef", on_label=lambda image, x, name: album
     if clef is not None else None
 print(f"objects: http://localhost:{args.port}  ({args.tokens} soft tokens per frame, {len(things.names)} things"
       + (", Clef teaching)" if clef else ")"), flush=True)
-ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
+server.RequestHandlerClass = Handler
+server.serve_forever()

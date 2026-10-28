@@ -4,6 +4,8 @@ A check to run before deploying a proxy question: given 150–300 real units wit
 EmbeddingGemma 2 student take the question over, at which layer, and how? The rules are in
 [`../../docs/question-design.md`](../../docs/question-design.md).
 
+From `examples/`:
+
 ```bash
 uv run preflight/preflight.py answers.jsonl --type noul --name my_question
 uv run preflight/preflight.py answers.jsonl --type choice --options source,test_run,build,search,vcs,edit,other
