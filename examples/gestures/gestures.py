@@ -88,8 +88,8 @@ class Question:
         return {"title": self.title, "answers": [{"name": n, "emoji": e, "key": k, "quiet": n == self.quiet}
                                                  for n, (e, k, _) in self.answers.items()]}
 
-    def teach(self, x, name):
-        self.choice.teach(x, name)
+    def teach(self, x, name, check=True):
+        self.choice.teach(x, name, check=check)
 
     def forget(self):
         self.choice.forget()
@@ -114,7 +114,7 @@ class Yes:
             {"name": "no", "emoji": "✖️", "key": "⇧" + self.key, "press": self.key.upper(), "quiet": True},
             {"name": "yes", "emoji": self.emoji, "key": self.key, "press": self.key, "alert": True}]}
 
-    def teach(self, x, name):
+    def teach(self, x, name, check=True):
         self.detector.teach(x, name)
 
     def forget(self):
@@ -175,9 +175,9 @@ class Handler(BaseHTTPRequestHandler):
 questions = {q: Question(*spec) for q, spec in QUESTIONS.items()} | {d: Yes(*spec) for d, spec in DETECTORS.items()}
 album = Album(Path(__file__).parent / "frames", eyes)
 kept = album.frames()
-for x, row in kept:  # teach again what was taught before the restart
+for x, row in kept:  # teach again what was taught before the restart (not checks: the student has seen them)
     if row["question"] in questions:
-        questions[row["question"]].teach(x, row["answer"])
+        questions[row["question"]].teach(x, row["answer"], check=False)
 if kept:
     print(f"taught again from {len(kept)} saved frames", flush=True)
 eyes.warm()

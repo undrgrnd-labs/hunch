@@ -158,7 +158,9 @@ function show(out) {
     $("clefHow").textContent = `${Math.round(t.p * 100)}% · ${t.ms} ms per look · ${t.per_minute} looks in the last minute`;
     $("clefWhere").textContent = `$${t.spent.toFixed(4)} spent`;
     $("agree").innerHTML = t.agree === null ? "" : `hunch agrees with Clef on <b>${Math.round(t.agree * 100)}%</b> of its last ${t.checked} sure answers`;
-    if (t.graduated.length) $("agree").innerHTML += `<br>graduated: ${t.graduated.map(n => emojiOf[n] ?? n).join(" ")}`;
+    // each thing's checks against Clef: it graduates (🎓) once the 95% lower bound of its agreement reaches the target
+    $("agree").innerHTML += t.progress.map(r => `<br>${r.emoji} ${r.name}: ${r.checks} checks, ${Math.round(r.agree * 100)}% `
+      + (r.graduated ? "🎓" : `(${Math.round(r.low * 100)}% of ${Math.round(t.target * 100)}% sure)`)).join("");
   }
   const quietThing = out.state === "quiet";
   $("bigEmoji").textContent = quietThing ? "" : out.state === "unsure" ? "🤔" : out.emoji;

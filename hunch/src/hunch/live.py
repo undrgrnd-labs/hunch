@@ -367,22 +367,25 @@ class Detector:
 
 class Watcher:
     """A teacher model watching the stream for a Choice. `teacher(frame, names)` answers which of `names` (or `ELSE`)
-    the frame (an image's bytes or a text) shows, as {answer: probability}; it's called one look at a time, from the Watcher's own thread.
+    the frame (an image's bytes or a text) shows, as {answer: probability}; it's called one look at a time, from the
+    Watcher's own thread.
 
     It looks at the newest frame when the student's answer is a graduated one and its random audit is due (on average
     every `audit_every` seconds), whenever it's one that hasn't graduated (or is unsure), or, when the answer is
-    quiet, every `idle` seconds while something is being shown (a held
-    thing can read as a bare hand), resting `rest` seconds between looks. Sure (`sure`), it checks the student's
-    answer (`Choice.check`), and labels the frame for the student, up to `cap` frames per answer, calling
-    `on_label(frame, x, name)`."""
+    quiet, every `idle` seconds while something is being shown (a held thing can read as a bare hand), resting `rest`
+    seconds between looks. Sure (`sure`), it labels the frame for the student, up to `cap` frames per answer, calling
+    `on_label(frame, x, name)`, and checks the student's answer (`Choice.check`) if it was steady: the same sure
+    answer for the last `steady` frames offered. A thing coming into view or leaving it is named for a frame or two
+    that show little of it; what a caller says out loud waits for a steady answer, and so do the checks."""
 
     def __init__(self, choice: Choice, teacher: Callable[[Frame, list[str]], dict[str, float]], *, by: str = "teacher",
                  sure: float = 0.5, cap: int = 60, rest: float = 0.3, idle: float = 3.0,
-                 fresh: float = 1.5, audit_every: float = 10.0,
+                 fresh: float = 1.5, audit_every: float = 10.0, steady: int = 3,
                  on_label: Callable[[Frame, np.ndarray, str], None] | None = None):
         self.choice, self.teacher, self.by, self.on_label = choice, teacher, by, on_label
         self.sure, self.cap, self.rest, self.idle, self.fresh = sure, cap, rest, idle, fresh
-        self.audit_every = audit_every
+        self.audit_every, self.steady = audit_every, steady
+        self.streak = (None, 0)  # the sure answer of the frames offered last, and for how many in a row
         self.audit_at: dict[str, float] = {}  # graduated answer: when its next audit is due
         self.newest = None
         self.wake = threading.Event()
@@ -394,6 +397,11 @@ class Watcher:
     def look(self, frame: Frame, x: np.ndarray, answer: dict) -> None:
         """Offers the newest frame and the student's answer for it; the teacher looks if that's worth it."""
         now, name = time.time(), answer["name"]
+        if answer["state"] == "sure":
+            self.streak = (name, self.streak[1] + 1 if self.streak[0] == name else 1)
+        else:
+            self.streak = (None, 0)
+        steady = self.streak[1] >= self.steady
         if answer["state"] == "quiet":
             since = now - self.looked[-1] if self.looked else self.idle
             worth = (answer["shown"] or 0) >= self.choice.shown and since >= self.idle
@@ -404,19 +412,20 @@ class Watcher:
         else:
             worth = True
         if worth:
-            self.newest = (frame, x, answer)
+            self.newest = (frame, x, answer, steady)
             self.wake.set()
 
     def forget(self) -> None:
         self.agree.clear()
         self.audit_at.clear()
+        self.streak = (None, 0)
         self.last = None
 
     def _watching(self):
         while True:
             self.wake.wait()
             self.wake.clear()
-            frame, x, answer = self.newest
+            frame, x, answer, steady = self.newest
             self.looked.append(time.time())
             t0 = time.perf_counter()
             out = self.teacher(frame, list(self.choice.names))
@@ -425,7 +434,7 @@ class Watcher:
             p = out[best]
             name = self.choice.find(best) if best != ELSE else None
             self.last = {"name": name or best, "known": name is not None, "p": p, "ms": ms, "at": time.time()}
-            if p >= self.sure:
+            if p >= self.sure and steady:
                 agreed = self.choice.check(answer, name)
                 if agreed is not None:
                     self.agree.append(agreed)

@@ -251,7 +251,7 @@ def test_the_watcher_audits_graduated_answers_at_random_moments(eyes, monkeypatc
     c = make_choice(eyes, min_checks=1, gap=0, target=0.0)
     c.check(sure("pen"), "pen")
     looks = []
-    w = Watcher(c, lambda frame, names: looks.append(frame) or {"pen": 0.9}, rest=0, audit_every=10)
+    w = Watcher(c, lambda frame, names: looks.append(frame) or {"pen": 0.9}, rest=0, audit_every=10, steady=1)
     monkeypatch.setattr(hunch.live.random, "expovariate", lambda rate: 1 / rate)
     x = frame(eyes, b"pen")
     graduated = sure("pen") | {"graduated": True}
@@ -270,7 +270,24 @@ def test_the_watcher_audits_graduated_answers_at_random_moments(eyes, monkeypatc
 
 def test_the_watcher_checks_the_answer_given_when_it_offered_the_frame(eyes):
     c = make_choice(eyes, gap=0)
-    w = Watcher(c, lambda frame, names: {ELSE: 0.9}, rest=0)
+    w = Watcher(c, lambda frame, names: {ELSE: 0.9}, rest=0, steady=1)
     w.look(b"shell", frame(eyes, b"pen"), sure("pen"))
     time.sleep(0.1)
     assert c.report()["pen"]["checks"] == 1 and c.report()["pen"]["agree"] == 0.0 and list(w.agree) == [False]
+
+
+def test_the_watcher_checks_only_steady_answers(eyes):
+    c = make_choice(eyes, gap=0)
+    w = Watcher(c, lambda frame, names: {"nothing": 0.9}, rest=0, steady=3)
+    x = frame(eyes, b"pen")
+    w.look(b"leaving", x, sure("pen"))  # one frame of "pen" as it leaves the view: looked at, not checked
+    time.sleep(0.1)
+    assert "pen" not in c.report()
+    for _ in range(3):
+        w.look(b"pen", x, sure("pen"))
+    time.sleep(0.1)
+    assert c.report()["pen"]["checks"] == 1
+    w.look(b"pen", x, {"state": "unsure", "name": "pen", "shown": 5})  # an unsure frame breaks the streak
+    w.look(b"pen", x, sure("pen"))
+    time.sleep(0.1)
+    assert c.report()["pen"]["checks"] == 1

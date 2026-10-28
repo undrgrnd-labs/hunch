@@ -1446,18 +1446,21 @@ var Watcher = class {
   constructor(choice, teacher, opts = {}) {
     this.choice = choice;
     this.teacher = teacher;
-    this.opts = { by: "teacher", sure: 0.5, cap: 60, rest: 0.3, idle: 3, fresh: 1.5, auditEvery: 10, ...opts };
+    this.opts = { by: "teacher", sure: 0.5, cap: 60, rest: 0.3, idle: 3, fresh: 1.5, auditEvery: 10, steady: 3, ...opts };
   }
   last = null;
   agree = [];
   looked = [];
   newest = null;
+  streak = { name: null, n: 0 };
   auditAt = /* @__PURE__ */ new Map();
   looking = false;
   opts;
   /** Offers the newest frame and the student's answer for it; the teacher looks if that's worth it. */
   look(image, x, answer) {
     const now = performance.now() / 1e3, o = this.opts, name = answer.name;
+    this.streak = answer.state === "sure" ? { name, n: this.streak.name === name ? this.streak.n + 1 : 1 } : { name: null, n: 0 };
+    const steady = this.streak.n >= o.steady;
     let worth;
     if (answer.state === "quiet") {
       worth = (answer.shown ?? 0) >= this.choice.opts.shown && now - (this.looked.at(-1) ?? -Infinity) >= o.idle;
@@ -1468,19 +1471,20 @@ var Watcher = class {
       worth = true;
     }
     if (!worth) return;
-    this.newest = { image, x, answer };
+    this.newest = { image, x, answer, steady };
     if (!this.looking) this.watch();
   }
   forget() {
     this.agree = [];
     this.auditAt.clear();
+    this.streak = { name: null, n: 0 };
     this.last = null;
   }
   async watch() {
     this.looking = true;
     try {
       while (this.newest) {
-        const { image, x, answer } = this.newest, o = this.opts;
+        const { image, x, answer, steady } = this.newest, o = this.opts;
         this.newest = null;
         this.looked = [...this.looked.slice(-199), performance.now() / 1e3];
         const t0 = performance.now();
@@ -1489,7 +1493,7 @@ var Watcher = class {
         const best = Object.keys(out).reduce((a, b) => out[b] > out[a] ? b : a);
         const name = best === ELSE ? null : this.choice.find(best);
         this.last = { name: name ?? best, known: name !== null, p: out[best], ms, at: performance.now() / 1e3 };
-        if (out[best] >= o.sure) {
+        if (out[best] >= o.sure && steady) {
           const agreed = this.choice.check(answer, name);
           if (agreed !== null) this.agree = [...this.agree.slice(-49), agreed];
         }

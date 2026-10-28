@@ -21,7 +21,8 @@ How it answers (hunch/src/hunch/live.py has the details):
                emoji from its name), and the teacher labels the frames it's sure about.
   the teacher  Clef picks one of the things or "something else". Sure of something else, it makes the page ask. It
                also says how each thing is named out loud: "that's an egg", "those are scissors", "that's rice".
-  graduation   each look of Clef's checks the student's sure answer for that frame. A thing graduates once its checks
+  graduation   each look of Clef's checks the student's answer for that frame, if it was steady (the same sure answer
+               three frames in a row, as the page waits for before it speaks). A thing graduates once its checks
                agree often enough (hunch.live's rules, as the proxy's), and only then is it named for sure; before,
                it's "I think that's a lemon". Clef audits graduated things at random moments, about every 10 s.
 
@@ -320,8 +321,12 @@ class Handler(BaseHTTPRequestHandler):
                 watcher.look(body, x, a)
                 said = watcher.describe()
                 if said is not None:
+                    progress = [{"name": n, "emoji": emoji_of(n), "checks": r["checks"], "agree": round(r["agree"], 3),
+                                 "low": round(r["low"], 3), "graduated": r["graduated"]}
+                                for n, r in things.report().items() if n not in things.quiet]
                     out["teacher"] = said | {"emoji": emoji_of(said["name"]) if said["known"] else "❓",
-                                             "spent": round(clef.clef.spent, 6)}
+                                             "spent": round(clef.clef.spent, 6), "target": things.target,
+                                             "progress": sorted(progress, key=lambda r: -r["checks"])[:6]}
                 if watcher.saw_else() and out["state"] != "quiet":
                     out["state"] = "unsure"  # the teacher sees a thing that isn't any of the known ones
             self.reply(out)
@@ -361,8 +366,8 @@ album = Album(FRAMES, eyes)
 ears = Ears()
 voice = voice_for(args.voice)
 kept = album.frames()
-for x, row in kept:  # teach again what was taught before the restart
-    things.teach(x, row["thing"], row.get("by", "you"))
+for x, row in kept:  # teach again what was taught before the restart (not checks: the student has seen them)
+    things.teach(x, row["thing"], row.get("by", "you"), check=False)
 if kept:
     print(f"taught again from {len(kept)} saved frames", flush=True)
 eyes.warm()

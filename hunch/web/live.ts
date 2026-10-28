@@ -458,30 +458,35 @@ export interface WatcherOptions {
   idle?: number;
   fresh?: number;
   auditEvery?: number; // seconds, on average, between looks at a graduated answer
+  steady?: number; // frames in a row with the same sure answer before a look checks it
   onLabel?: (image: Blob, x: Vector, name: string) => void;
 }
 
 /** A teacher model watching the stream for a Choice. It looks at the newest frame when the student's answer is a
  * graduated one and its random audit is due, whenever it's one that hasn't graduated (or is unsure), or, when the
  * answer is quiet, every `idle` seconds while something is being shown,
- * resting `rest` seconds between looks. Sure, it checks the student's answer, and labels the frame for the student,
- * up to `cap` frames per answer. */
+ * resting `rest` seconds between looks. Sure, it labels the frame for the student, up to `cap` frames per answer,
+ * and checks the student's answer if it was steady: the same sure answer for the last `steady` frames offered, since
+ * a thing coming into view or leaving it is named for a frame or two that show little of it. */
 export class Watcher {
   last: { name: string; known: boolean; p: number; ms: number; at: number } | null = null;
   agree: boolean[] = [];
   private looked: number[] = [];
-  private newest: { image: Blob; x: Vector; answer: Answer } | null = null;
+  private newest: { image: Blob; x: Vector; answer: Answer; steady: boolean } | null = null;
+  private streak: { name: string | null; n: number } = { name: null, n: 0 };
   private auditAt = new Map<string, number>();
   private looking = false;
   readonly opts: Required<Omit<WatcherOptions, 'onLabel'>> & Pick<WatcherOptions, 'onLabel'>;
 
   constructor(readonly choice: Choice, readonly teacher: Teacher, opts: WatcherOptions = {}) {
-    this.opts = { by: 'teacher', sure: 0.5, cap: 60, rest: 0.3, idle: 3, fresh: 1.5, auditEvery: 10, ...opts };
+    this.opts = { by: 'teacher', sure: 0.5, cap: 60, rest: 0.3, idle: 3, fresh: 1.5, auditEvery: 10, steady: 3, ...opts };
   }
 
   /** Offers the newest frame and the student's answer for it; the teacher looks if that's worth it. */
   look(image: Blob, x: Vector, answer: Answer): void {
     const now = performance.now() / 1000, o = this.opts, name = answer.name;
+    this.streak = answer.state === 'sure' ? { name, n: this.streak.name === name ? this.streak.n + 1 : 1 } : { name: null, n: 0 };
+    const steady = this.streak.n >= o.steady;
     let worth: boolean;
     if (answer.state === 'quiet') {
       worth = (answer.shown ?? 0) >= this.choice.opts.shown && now - (this.looked.at(-1) ?? -Infinity) >= o.idle;
@@ -492,13 +497,14 @@ export class Watcher {
       worth = true;
     }
     if (!worth) return;
-    this.newest = { image, x, answer };
+    this.newest = { image, x, answer, steady };
     if (!this.looking) this.watch();
   }
 
   forget(): void {
     this.agree = [];
     this.auditAt.clear();
+    this.streak = { name: null, n: 0 };
     this.last = null;
   }
 
@@ -506,7 +512,7 @@ export class Watcher {
     this.looking = true;
     try {
       while (this.newest) {
-        const { image, x, answer } = this.newest, o = this.opts;
+        const { image, x, answer, steady } = this.newest, o = this.opts;
         this.newest = null;
         this.looked = [...this.looked.slice(-199), performance.now() / 1000];
         const t0 = performance.now();
@@ -515,7 +521,7 @@ export class Watcher {
         const best = Object.keys(out).reduce((a, b) => (out[b] > out[a] ? b : a));
         const name = best === ELSE ? null : this.choice.find(best);
         this.last = { name: name ?? best, known: name !== null, p: out[best], ms, at: performance.now() / 1000 };
-        if (out[best] >= o.sure) {
+        if (out[best] >= o.sure && steady) {
           const agreed = this.choice.check(answer, name);
           if (agreed !== null) this.agree = [...this.agree.slice(-49), agreed];
         }
