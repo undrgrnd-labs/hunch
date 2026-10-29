@@ -553,8 +553,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
 // Fused full (unmasked) attention for head_dim 64, reading q/k/v from the [t, 3 nh 64] qkv buffer, online softmax
 // over key tiles of 32, writing out [t, nh 64]. One workgroup (128 threads) per (32-query block, head). Each run of
 // 8 consecutive invocations owns 2 query rows (scores for 4 keys each, outputs for 8 columns each); row max and sum
-// reduce across those 8 lanes with subgroup shuffles (subgroup size >= 8, invocations laid out linearly). Scale 1.
-export const flash64 = `enable subgroups;
+// reduce across those 8 lanes: with `subgroups`, by subgroup shuffles (subgroup size >= 8, invocations laid out
+// linearly); without (Firefox has no subgroups), through workgroup memory. Scale 1.
+export const flash64 = (subgroups) => `${subgroups ? 'enable subgroups;' : ''}
 ${uniforms(['t', 'nh'])}
 @group(0) @binding(1) var<storage, read> X: array<f32>;
 @group(0) @binding(2) var<storage, read_write> O: array<f32>;
@@ -563,16 +564,34 @@ var<workgroup> Qt: array<vec2<f32>, 1024>;  // [c][q/2]
 var<workgroup> Kt: array<vec4<f32>, 512>;   // [c][k/4]
 var<workgroup> Vs: array<vec4<f32>, 512>;   // [k][c/4]
 var<workgroup> Ps: array<vec4<f32>, 256>;   // [q][k/4]
-fn rmax(v: f32) -> f32 {
+${subgroups ? `fn rmax(v: f32, li: u32) -> f32 {
   var m = max(v, subgroupShuffleXor(v, 1u));
   m = max(m, subgroupShuffleXor(m, 2u));
   return max(m, subgroupShuffleXor(m, 4u));
 }
-fn rsum(v: f32) -> f32 {
+fn rsum(v: f32, li: u32) -> f32 {
   var m = v + subgroupShuffleXor(v, 1u);
   m = m + subgroupShuffleXor(m, 2u);
   return m + subgroupShuffleXor(m, 4u);
+}` : `var<workgroup> Red: array<f32, 128>;
+fn rmax(v: f32, li: u32) -> f32 {
+  Red[li] = v;
+  workgroupBarrier();
+  let b = li & ~7u;
+  var m = Red[b];
+  for (var i = 1u; i < 8u; i++) { m = max(m, Red[b + i]); }
+  workgroupBarrier();
+  return m;
 }
+fn rsum(v: f32, li: u32) -> f32 {
+  Red[li] = v;
+  workgroupBarrier();
+  let b = li & ~7u;
+  var m = Red[b];
+  for (var i = 1u; i < 8u; i++) { m += Red[b + i]; }
+  workgroupBarrier();
+  return m;
+}`}
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
   let q0 = wg.x * BQ;
@@ -623,12 +642,12 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     for (var z = 0u; z < 4u; z++) {
       if (k0 + kq * 4u + z >= p.t) { sa[z] = -3.0e38; sb[z] = -3.0e38; }
     }
-    let mx = vec2<f32>(max(m.x, rmax(max(max(sa.x, sa.y), max(sa.z, sa.w)))),
-                       max(m.y, rmax(max(max(sb.x, sb.y), max(sb.z, sb.w)))));
+    let mx = vec2<f32>(max(m.x, rmax(max(max(sa.x, sa.y), max(sa.z, sa.w)), li)),
+                       max(m.y, rmax(max(max(sb.x, sb.y), max(sb.z, sb.w)), li)));
     let pa = exp(sa - mx.x);
     let pb = exp(sb - mx.y);
     let alpha = exp(m - mx);
-    l = l * alpha + vec2<f32>(rsum(pa.x + pa.y + pa.z + pa.w), rsum(pb.x + pb.y + pb.z + pb.w));
+    l = l * alpha + vec2<f32>(rsum(pa.x + pa.y + pa.z + pa.w, li), rsum(pb.x + pb.y + pb.z + pb.w, li));
     m = mx;
     Ps[(2u * r) * 8u + kq] = pa;
     Ps[(2u * r + 1u) * 8u + kq] = pb;

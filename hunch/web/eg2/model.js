@@ -60,6 +60,8 @@ export async function load(base = '.', { subgroupMatrix = true, onProgress = nul
   const special = new Float32Array(bin, man.tensors['t.special'].offset, 4 * 512);
   const m = new Model(device, adapter, man, W, special.slice());
   m.useSG = subgroupMatrix && device.features.has('chromium-experimental-subgroup-matrix');
+  // the attention kernel's shuffles reduce over 8 lanes, so they need subgroups of at least 8
+  m.useSubgroups = device.features.has('subgroups') && (adapter.info?.subgroupMinSize ?? 8) >= 8;
   await device.queue.onSubmittedWorkDone();
   for (const b of temp) b.destroy();
   m.format = man.format || 'bf16';
@@ -290,7 +292,7 @@ class Model {
       if (hd !== 64) throw new Error('vision kernels assume head_dim 64');
       this.op(plan, 'qkvAxial64', K.qkvAxial64, [nh, gw, 3 * nh],
         [B.qkv, W[P + 'self_attn.q_norm'], W[P + 'self_attn.k_norm'], vcos, vsin], [(t * 3 * nh) / 4, 1, 1]);
-      this.op(plan, 'flash64', K.flash64, [t, nh], [B.qkv, B.attn], [Math.ceil(t / 32), nh, 1]);
+      this.op(plan, 'flash64', K.flash64(this.useSubgroups), [t, nh], [B.qkv, B.attn], [Math.ceil(t / 32), nh, 1]);
       this.mmW(plan, B.attn, W[P + 'wo'], B.o, t, d, d, { padded: true });
       this.op(plan, 'addnorm', K.norm('addnorm'), [d], [W[P + 'post_attention_layernorm'], B.o, B.h, B.x, W[P + 'pre_feedforward_layernorm']], rowsGrid(t));
       this.mmW(plan, B.x, W[P + 'wgu'], B.gu, t, 2 * inter, d, { padded: true });

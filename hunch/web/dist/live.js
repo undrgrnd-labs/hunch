@@ -444,7 +444,7 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
   ${accs.map(([i, j]) => `subgroupMatrixStore(&C, cBase + (m0 + ${i * 8}u) * p.ldc + n0 + ${j * 8}u, a${i}_${j}, false, p.ldc);`).join("\n  ")}
 }`;
 };
-var flash64 = `enable subgroups;
+var flash64 = (subgroups) => `${subgroups ? "enable subgroups;" : ""}
 ${uniforms(["t", "nh"])}
 @group(0) @binding(1) var<storage, read> X: array<f32>;
 @group(0) @binding(2) var<storage, read_write> O: array<f32>;
@@ -453,16 +453,34 @@ var<workgroup> Qt: array<vec2<f32>, 1024>;  // [c][q/2]
 var<workgroup> Kt: array<vec4<f32>, 512>;   // [c][k/4]
 var<workgroup> Vs: array<vec4<f32>, 512>;   // [k][c/4]
 var<workgroup> Ps: array<vec4<f32>, 256>;   // [q][k/4]
-fn rmax(v: f32) -> f32 {
+${subgroups ? `fn rmax(v: f32, li: u32) -> f32 {
   var m = max(v, subgroupShuffleXor(v, 1u));
   m = max(m, subgroupShuffleXor(m, 2u));
   return max(m, subgroupShuffleXor(m, 4u));
 }
-fn rsum(v: f32) -> f32 {
+fn rsum(v: f32, li: u32) -> f32 {
   var m = v + subgroupShuffleXor(v, 1u);
   m = m + subgroupShuffleXor(m, 2u);
   return m + subgroupShuffleXor(m, 4u);
+}` : `var<workgroup> Red: array<f32, 128>;
+fn rmax(v: f32, li: u32) -> f32 {
+  Red[li] = v;
+  workgroupBarrier();
+  let b = li & ~7u;
+  var m = Red[b];
+  for (var i = 1u; i < 8u; i++) { m = max(m, Red[b + i]); }
+  workgroupBarrier();
+  return m;
 }
+fn rsum(v: f32, li: u32) -> f32 {
+  Red[li] = v;
+  workgroupBarrier();
+  let b = li & ~7u;
+  var m = Red[b];
+  for (var i = 1u; i < 8u; i++) { m += Red[b + i]; }
+  workgroupBarrier();
+  return m;
+}`}
 @compute @workgroup_size(128)
 fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) li: u32) {
   let q0 = wg.x * BQ;
@@ -513,12 +531,12 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(local_invocation_index) l
     for (var z = 0u; z < 4u; z++) {
       if (k0 + kq * 4u + z >= p.t) { sa[z] = -3.0e38; sb[z] = -3.0e38; }
     }
-    let mx = vec2<f32>(max(m.x, rmax(max(max(sa.x, sa.y), max(sa.z, sa.w)))),
-                       max(m.y, rmax(max(max(sb.x, sb.y), max(sb.z, sb.w)))));
+    let mx = vec2<f32>(max(m.x, rmax(max(max(sa.x, sa.y), max(sa.z, sa.w)), li)),
+                       max(m.y, rmax(max(max(sb.x, sb.y), max(sb.z, sb.w)), li)));
     let pa = exp(sa - mx.x);
     let pb = exp(sb - mx.y);
     let alpha = exp(m - mx);
-    l = l * alpha + vec2<f32>(rsum(pa.x + pa.y + pa.z + pa.w), rsum(pb.x + pb.y + pb.z + pb.w));
+    l = l * alpha + vec2<f32>(rsum(pa.x + pa.y + pa.z + pa.w, li), rsum(pb.x + pb.y + pb.z + pb.w, li));
     m = mx;
     Ps[(2u * r) * 8u + kq] = pa;
     Ps[(2u * r + 1u) * 8u + kq] = pb;
@@ -656,6 +674,7 @@ async function load(base = ".", { subgroupMatrix = true, onProgress = null } = {
   const special = new Float32Array(bin, man.tensors["t.special"].offset, 4 * 512);
   const m = new Model(device, adapter, man, W, special.slice());
   m.useSG = subgroupMatrix && device.features.has("chromium-experimental-subgroup-matrix");
+  m.useSubgroups = device.features.has("subgroups") && (adapter.info?.subgroupMinSize ?? 8) >= 8;
   await device.queue.onSubmittedWorkDone();
   for (const b of temp) b.destroy();
   m.format = man.format || "bf16";
@@ -910,7 +929,7 @@ var Model = class {
         [B.qkv, W[P + "self_attn.q_norm"], W[P + "self_attn.k_norm"], vcos, vsin],
         [t * 3 * nh / 4, 1, 1]
       );
-      this.op(plan, "flash64", flash64, [t, nh], [B.qkv, B.attn], [Math.ceil(t / 32), nh, 1]);
+      this.op(plan, "flash64", flash64(this.useSubgroups), [t, nh], [B.qkv, B.attn], [Math.ceil(t / 32), nh, 1]);
       this.mmW(plan, B.attn, W[P + "wo"], B.o, t, d, d, { padded: true });
       this.op(plan, "addnorm", norm("addnorm"), [d], [W[P + "post_attention_layernorm"], B.o, B.h, B.x, W[P + "pre_feedforward_layernorm"]], rowsGrid(t));
       this.mmW(plan, B.x, W[P + "wgu"], B.gu, t, 2 * inter, d, { padded: true });
