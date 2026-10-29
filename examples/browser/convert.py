@@ -1,12 +1,16 @@
 """Extract the tensors EmbeddingGemma 2's image path needs into weights.bin + manifest.json.
 
-Matrices stay bf16 (raw u16, exact); the shaders widen them to f32. Norm weights, layer scalars and the four
-special-token embedding rows are stored as f32. Matrices that run on the same input are stacked along their
-output dimension (q|k|v, gate|up) so one matmul computes them.
+Matrices are stored as int8 codes with one f32 scale per row (the row's largest magnitude over 127) by default, half
+the size of the checkpoint's bf16; the page turns them back into bf16 on the GPU as it loads, so the kernels see bf16
+either way. --format bf16 keeps the exact bf16 values; --format fp8 stores e4m3 codes (scale: largest magnitude over
+448). The shaders widen bf16 to f32. Norm weights, layer scalars and the four special-token embedding rows are stored
+as f32. Matrices that run on the same input are stacked along their output dimension (q|k|v, gate|up) so one matmul
+computes them.
 
-usage: python convert.py [out_dir]     # weights/ next to this script by default
+usage: python convert.py [out_dir] [--format int8|bf16|fp8]     # weights/ next to this script by default
 """
 
+import argparse
 import glob
 import json
 import os
@@ -34,7 +38,11 @@ def checkpoint():
 
 SRC = checkpoint()
 CFG = json.load(open(os.path.join(os.path.dirname(SRC), "config.json")))
-OUT = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights")
+ap = argparse.ArgumentParser()
+ap.add_argument("out", nargs="?", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "weights"))
+ap.add_argument("--format", choices=["int8", "bf16", "fp8"], default="int8", help="how the matrices are stored")
+args = ap.parse_args()
+OUT = args.out
 os.makedirs(OUT, exist_ok=True)
 POS_ROWS = 840  # largest patch-grid side at a 280 soft-token budget (2520 patches)
 
@@ -70,11 +78,39 @@ def put(name, arr, dtype):
     tensors[name] = {"offset": pos, "nbytes": data.nbytes, "dtype": dtype, "shape": list(arr.shape)}
 
 
+# fp8 e4m3 (no infinities; 0x7f and 0xff are NaN): every finite code's value, for rounding to the nearest
+E4M3 = np.array([(-1) ** (c >> 7) * (((c & 7) / 8) * 2.0 ** -6 if (c >> 3) & 15 == 0 else (1 + (c & 7) / 8) * 2.0 ** (((c >> 3) & 15) - 7))
+                 for c in range(256)], np.float32)
+E4M3_POS = np.argsort(np.where(np.arange(256) < 127, E4M3, np.inf))[:127]  # the codes 0..126, by value
+
+
+def quantize(name, a):
+    """A matrix as 8-bit codes (rows x columns, bytes) and one f32 scale per row. A table with more dimensions is taken
+    as rows of its last one (the same bytes in the same order)."""
+    x = f32(a).astype(np.float32).reshape(-1, a.shape[-1])
+    top = np.abs(x).max(axis=1, keepdims=True)
+    if args.format == "int8":
+        scale = np.where(top > 0, top / 127, 1).astype(np.float32)
+        codes = np.clip(np.round(x / scale), -127, 127).astype(np.int8).view(np.uint8)
+    else:
+        scale = np.where(top > 0, top / 448, 1).astype(np.float32)
+        y = np.abs(x / scale)
+        vals = E4M3[E4M3_POS]
+        i = np.clip(np.searchsorted(vals, y), 1, len(vals) - 1)
+        nearest = np.where(np.abs(vals[i - 1] - y) <= np.abs(vals[i] - y), i - 1, i)
+        codes = (E4M3_POS[nearest] | np.where(x < 0, 0x80, 0)).astype(np.uint8)
+    put(name, codes, args.format)
+    put(name + ".scale", scale[:, 0], "f32")
+
+
 def bf(name, *srcs, rows=None):
     a = np.concatenate([raw(s) for s in srcs], axis=0) if len(srcs) > 1 else raw(srcs[0])
     if rows is not None:
         a = a[:, :rows]
-    put(name, a, "bf16")
+    if args.format == "bf16":
+        put(name, a, "bf16")
+    else:
+        quantize(name, a)
 
 
 def fl(name, src):
@@ -119,6 +155,6 @@ emb = raw("language_model.embed_tokens.weight")
 put("t.special", f32(emb[ids]), "f32")
 out.close()
 
-json.dump({"config": CFG, "special_ids": ids, "pos_rows": POS_ROWS, "tensors": tensors},
+json.dump({"config": CFG, "special_ids": ids, "pos_rows": POS_ROWS, "format": args.format, "tensors": tensors},
           open(os.path.join(OUT, "manifest.json"), "w"), indent=1)
 print(f"{len(tensors)} tensors, {os.path.getsize(os.path.join(OUT, 'weights.bin')) / 1e6:.1f} MB")
