@@ -12,10 +12,10 @@ python3 -m http.server 8803 --bind 127.0.0.1
 ```
 
 **Needs:** the EmbeddingGemma 2 checkpoint (`convert.py` finds it where eg2cpu does: `EG2_MODEL_DIR`, else the Hugging
-Face cache), a browser with WebGPU (tested in Chrome 156 on Apple silicon), and a webcam; browsers allow the camera on
-`http://localhost` but not on other plain-HTTP addresses. **Ships:** `things.json`, the prompt vectors below, and
-hunch.live's bundle (`hunch/web/dist/live.js`), so nothing needs building; the weights don't ship. The page fetches
-the 290 MB of weights from the server each time it loads.
+Face cache), a browser with WebGPU (tested in Chrome 156 and Firefox 159 on Apple silicon), and a webcam; browsers
+allow the camera on `http://localhost` but not on other plain-HTTP addresses. **Ships:** `things.json`, the prompt
+vectors below, and hunch.live's bundle (`hunch/web/dist/live.js`), so nothing needs building; the weights don't
+ship. The page fetches the 290 MB of weights from the server each time it loads.
 
 ## What it does
 
@@ -40,12 +40,13 @@ the 290 MB of weights from the server each time it loads.
 
 ## What it found
 
-On an Apple M5 Pro in Chrome 156, at 70 soft tokens (the webcam demos' size):
+On an Apple M5 Pro in Chrome 156 and Firefox 159, at 70 soft tokens (the webcam demos' size):
 
 | | ms per frame (median) | cosine with eg2cpu |
 |---|---|---|
 | WebGPU, stock Chrome | 55–57 | 1.000000 on every test image |
 | WebGPU, `--enable-unsafe-webgpu` (subgroup-matrix matmuls) | 45–48 | 1.000000 |
+| WebGPU, Firefox (no subgroups) | 100 | 1.000000 on 11 of 13 test images; 0.9995 on a JPEG, 0.9967 on an RGBA PNG |
 | eg2cpu on the same machine's CPU (SME) | about 110 | – |
 
 - **Parity:** the 5 eg2cpu image fixtures and a 640×480 webcam frame, fed to both engines as the same resized
@@ -55,6 +56,10 @@ On an Apple M5 Pro in Chrome 156, at 70 soft tokens (the webcam demos' size):
   up the GPU takes about 0.3 s; a first frame at a new size takes up to 0.2 s more, for shader compiles.
 - **Where the time goes** (subgroup-matrix path): vision matmuls about 30 ms, vision attention 5 ms, the text tower
   about 8 ms.
+- **Firefox** has no `subgroups`, so attention reduces through workgroup memory there. Its GPU work takes about 86 ms
+  a frame, but Firefox reports finished GPU work in steps of 100 ms, so a frame takes 100 ms. Firefox bounds-checks
+  every index into an array, so the kernels keep per-thread values in named variables rather than arrays and read
+  their tiles as `vec4`s.
 - **Weight formats:** the table is with bf16 weights. Against them, int8 weights give a cosine of 0.9996–0.9998 on the
   fixtures and 8 Quick, Draw! doodles (median 0.9998), and e4m3 fp8 weights 0.9979–0.9990. Speed is the same in all
   three (about 50 ms a frame with subgroup matrices), since the kernels see bf16; int8 and fp8 halve the download and
