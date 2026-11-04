@@ -180,8 +180,10 @@ release the GIL) reach 14,000–18,000 tokens/s with AMX, close to explicit batc
 
 ## Arm Neoverse V2 (AWS c8g.4xlarge, Graviton 4, 16 cores, NEON and BFMMLA)
 
-Two modes: fp32 math on bf16 weights (the default), and `EG2_BF16=bfmmla`, which runs the weight matmuls in bf16 with
-`BFMMLA` and rounds activations to bf16. Against PyTorch fp32 (`tests/reference.rs`):
+Two modes: `EG2_BF16=bfmmla` (the default on Arm Linux), which runs the matmuls in bf16 with `BFMMLA` and rounds
+activations to bf16, and fp32 math on bf16 weights (`EG2_BF16=off`). The numbers in this section have attention in
+fp32 (`EG2_BF16_ATTN=off`); attention in bf16 as well gains up to 1.5x more on long inputs (see Neoverse N2 below).
+Against PyTorch fp32 (`tests/reference.rs`):
 
 | mode | lowest embedding cosine | worst layer-mean relative error |
 |---|---|---|
@@ -228,3 +230,25 @@ texts use 8 threads up to 40 tokens and all 16 threads above 40 tokens. The thre
 |---|---|---|
 | full pass | $0.031 (2,400 tokens/s) | $0.010 (7,100–7,400 tokens/s) |
 | layer-8 exit, 128-token units | $0.011 (6,600 tokens/s) | $0.0038 (19,200 tokens/s) |
+
+## Arm Neoverse N2 (GitHub Actions `ubuntu-24.04-arm`, Azure Cobalt 100, 4 cores, NEON and BFMMLA)
+
+A shared CI runner, one run each, so the numbers are rough. fp32 (`EG2_BF16=off`) against `BFMMLA` with attention in
+fp32 (`EG2_BF16_ATTN=off`) and in bf16 (the default):
+
+| | fp32 | bfmmla, attention fp32 | bfmmla (default) | speedup |
+|---|---|---|---|---|
+| 1 text, 32 tokens | 91.7 ms | 31.9 ms | 32.7 ms | 2.8x |
+| 1 text, 128 tokens | 306 ms | 92.1 ms | 87.5 ms | 3.5x |
+| 1 text, 512 tokens | 1,279 ms | 436 ms | 327 ms | 3.9x |
+| 256 texts x 32 tokens | 461 tokens/s | 1,794 tokens/s | 1,843 tokens/s | 4.0x |
+| 256 texts x 128 tokens | 455 tokens/s | 1,947 tokens/s | 2,112 tokens/s | 4.6x |
+| image, 70 soft tokens | 1,754 ms | 464 ms | 420 ms | 4.2x |
+| image, 280 soft tokens | 8,473 ms | 3,530 ms | 2,387 ms | 3.5x |
+| audio, 5 s | 960 ms | 258 ms | 250 ms | 3.8x |
+| audio, 30 s | 5,618 ms | 1,606 ms | 1,359 ms | 4.1x |
+
+Attention in bf16 matters where it is a large share of the work: 512-token texts, 280-soft-token images (2,340
+patches in the vision tower) and 30 s clips (the text tower over 754 tokens). The audio tower's own attention spans 12
+frames and stays in fp32. All of `cargo test --release` passes in both modes on this runner, in CI.
+

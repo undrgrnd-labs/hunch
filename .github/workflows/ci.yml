@@ -31,11 +31,17 @@ jobs:
       - run: cargo fmt --check
 
   eg2cpu:
-    name: eg2cpu (${{ matrix.os }})
+    name: eg2cpu (${{ matrix.os }}, EG2_BF16=${{ matrix.bf16 }})
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, ubuntu-24.04-arm]
+        bf16: [default]
+        # Arm Linux runs bf16 BFMMLA matmuls by default; check the fp32 path there too (a value of its own, so this is
+        # a job of its own rather than merged into the default one)
+        include:
+          - os: ubuntu-24.04-arm
+            bf16: "off"
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -75,3 +81,4 @@ jobs:
         run: EG2_MODEL_DIR=~/eg2/$EG2_REVISION cargo test --release
         env:
           EG2_REQUIRE_MODEL: "1"
+          EG2_BF16: ${{ matrix.bf16 != 'default' && matrix.bf16 || '' }}

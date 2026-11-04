@@ -43,8 +43,8 @@ multiplies a 16 × 32 bf16 tile by a 32 × 16 bf16 tile into 16 × 16 fp32 sums,
 instruction. Used when `EG2_BF16=amx`. `simd::amx`.
 
 **bf16 mode.** `EG2_BF16=amx|dot|bfmmla`: matmuls multiply in bf16, activations included, with fp32 accumulation.
-Embeddings stay at cosine ≥ 0.99999 to the reference, with layer means within about 0.6%. Off by default.
-`bf16_mode`.
+Embeddings stay at cosine ≥ 0.99999 to the reference, with layer means within about 0.6%. Off by default, except
+`bfmmla` on Arm Linux CPUs with BF16 and no SME. `bf16_mode`.
 
 **Pair packing.** Weights packed in panels of 32 output columns, with k in pairs, `(w[c][2q], w[c][2q+1])`: the input
 layout of `vdpbf16ps`, and exactly AMX's B-tile layout.

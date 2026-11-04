@@ -2,8 +2,8 @@
 //! audio tower.
 //!
 //! bf16 weights, fp32 math, runtime-dispatched kernels for AVX-512, AVX2+FMA, NEON, or scalar, and SME matmuls on
-//! Apple M4 and later. `EG2_BF16` opts into bf16 matmuls: AMX tiles or AVX-512 BF16 dot products on x86, BFMMLA on
-//! Arm.
+//! Apple M4 and later. `EG2_BF16` selects bf16 matmuls: AMX tiles or AVX-512 BF16 dot products on x86, BFMMLA on
+//! Arm, the default on Arm Linux CPUs with BF16 and no SME.
 
 mod audio;
 mod decision;
