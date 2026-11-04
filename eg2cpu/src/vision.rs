@@ -128,7 +128,9 @@ fn into_rgb(img: image::DynamicImage) -> Result<Rgb> {
 
 /// The processor's `get_aspect_ratio_preserving_size`: the largest (height, width) with at most `max_patches`
 /// patches and both sides multiples of `patch * pool`.
-pub fn target_size(height: usize, width: usize, patch: usize, pool: usize, max_patches: usize) -> Result<(usize, usize)> {
+pub fn target_size(
+    height: usize, width: usize, patch: usize, pool: usize, max_patches: usize,
+) -> Result<(usize, usize)> {
     let target_px = (max_patches * patch * patch) as f64;
     let factor = (target_px / (height * width) as f64).sqrt();
     let side = pool * patch;
@@ -174,7 +176,8 @@ fn resize_weights(insz: usize, outsz: usize) -> (Vec<(usize, Vec<i32>)>, u32) {
             let center = scale * (i as f64 + 0.5);
             let xmin = ((center - support + 0.5) as i64).max(0);
             let xsize = (((center + support + 0.5) as i64).min(insz as i64) - xmin).clamp(0, max_interp);
-            let mut w: Vec<f64> = (0..xsize).map(|j| cubic((j as f64 + xmin as f64 - center + 0.5) * invscale)).collect();
+            let mut w: Vec<f64> =
+                (0..xsize).map(|j| cubic((j as f64 + xmin as f64 - center + 0.5) * invscale)).collect();
             let total: f64 = w.iter().sum();
             if total != 0.0 {
                 w.iter_mut().for_each(|v| *v /= total);
@@ -225,16 +228,19 @@ fn resize_axis(src: &[u8], outer: usize, n: usize, inner: usize, out: usize) -> 
         });
         return dst;
     }
-    dst.par_chunks_mut(inner).with_min_len((1024 / inner).max(1)).enumerate().for_each_init(Vec::new, |acc, (oi, dst)| {
-        let (o, (xmin, w)) = (oi / out, &ws[oi % out]);
-        acc.clear();
-        acc.resize(inner, round);
-        for (j, &wj) in w.iter().enumerate() {
-            let row = &src[(o * n + xmin + j) * inner..][..inner];
-            acc.iter_mut().zip(row).for_each(|(a, &x)| *a += x as i32 * wj);
-        }
-        dst.iter_mut().zip(acc.iter()).for_each(|(d, &a)| *d = (a >> prec).clamp(0, 255) as u8);
-    });
+    dst.par_chunks_mut(inner).with_min_len((1024 / inner).max(1)).enumerate().for_each_init(
+        Vec::new,
+        |acc, (oi, dst)| {
+            let (o, (xmin, w)) = (oi / out, &ws[oi % out]);
+            acc.clear();
+            acc.resize(inner, round);
+            for (j, &wj) in w.iter().enumerate() {
+                let row = &src[(o * n + xmin + j) * inner..][..inner];
+                acc.iter_mut().zip(row).for_each(|(a, &x)| *a += x as i32 * wj);
+            }
+            dst.iter_mut().zip(acc.iter()).for_each(|(d, &a)| *d = (a >> prec).clamp(0, 255) as u8);
+        },
+    );
     dst
 }
 
@@ -311,9 +317,17 @@ impl Vision {
                     post_ff_ln: t.bf16_f32(&p("post_feedforward_layernorm.weight"), &[d])?,
                     q_norm: t.bf16_f32(&p("self_attn.q_norm.weight"), &[hd])?,
                     k_norm: t.bf16_f32(&p("self_attn.k_norm.weight"), &[hd])?,
-                    wqkv: t.stacked(&["q", "k", "v"].map(|x| p(&format!("self_attn.{x}_proj.linear.weight"))), nh * hd, d)?,
+                    wqkv: t.stacked(
+                        &["q", "k", "v"].map(|x| p(&format!("self_attn.{x}_proj.linear.weight"))),
+                        nh * hd,
+                        d,
+                    )?,
                     wo: t.packed(&p("self_attn.o_proj.linear.weight"), d, nh * hd)?,
-                    w_gate_up: t.stacked(&[p("mlp.gate_proj.linear.weight"), p("mlp.up_proj.linear.weight")], inter, d)?,
+                    w_gate_up: t.stacked(
+                        &[p("mlp.gate_proj.linear.weight"), p("mlp.up_proj.linear.weight")],
+                        inter,
+                        d,
+                    )?,
                     w_down: t.packed(&p("mlp.down_proj.linear.weight"), d, inter)?,
                 })
             })
@@ -321,7 +335,11 @@ impl Vision {
         let pp = 3 * cfg.patch * cfg.patch;
         Ok(Self {
             input_proj: t.packed("vision_tower.patch_embedder.input_proj.weight", d, pp)?,
-            pos_offset: t.offset("vision_tower.patch_embedder.position_embedding_table", "BF16", &[2, cfg.pos_size, d])?,
+            pos_offset: t.offset(
+                "vision_tower.patch_embedder.position_embedding_table",
+                "BF16",
+                &[2, cfg.pos_size, d],
+            )?,
             proj: t.packed("embed_vision.embedding_projection.weight", text_hidden, d)?,
             layers,
             cfg: cfg.clone(),
@@ -360,7 +378,8 @@ impl Vision {
             h.par_chunks_mut(d).enumerate().for_each(|(i, h)| {
                 let (xs, ys) = (row(0, i % gw), row(1, i / gw));
                 for ((v, x), y) in h.iter_mut().zip(xs.chunks_exact(2)).zip(ys.chunks_exact(2)) {
-                    let (x, y) = (bf16_to_f32(u16::from_le_bytes([x[0], x[1]])), bf16_to_f32(u16::from_le_bytes([y[0], y[1]])));
+                    let (x, y) =
+                        (bf16_to_f32(u16::from_le_bytes([x[0], x[1]])), bf16_to_f32(u16::from_le_bytes([y[0], y[1]])));
                     *v += x + y;
                 }
             });
@@ -442,7 +461,9 @@ impl Vision {
             if crate::model::sme() {
                 return crate::sme::attention(qkv, 3 * qd, t, nh, hd, qkt, attn);
             }
-            let part = |i: usize| -> Vec<f32> { qkv.chunks_exact(3 * qd).flat_map(|r| &r[i * qd..(i + 1) * qd]).copied().collect() };
+            let part = |i: usize| -> Vec<f32> {
+                qkv.chunks_exact(3 * qd).flat_map(|r| &r[i * qd..(i + 1) * qd]).copied().collect()
+            };
             attn.copy_from_slice(&attention(&part(0), &part(1), &part(2), t, nh, nh, hd, None));
         });
         trace("vision gemm o", || gemm_packed(t, attn, qd, &l.wo, o, d));

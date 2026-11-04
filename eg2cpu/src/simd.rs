@@ -444,7 +444,10 @@ pub fn bf16_mode() -> Bf16 {
         }
         // SME matmuls take precedence: with `sme::available`, `bfmmla` is ignored.
         #[cfg(target_arch = "aarch64")]
-        if isa() == Isa::Neon && want == "bfmmla" && std::arch::is_aarch64_feature_detected!("bf16") && !crate::sme::available()
+        if isa() == Isa::Neon
+            && want == "bfmmla"
+            && std::arch::is_aarch64_feature_detected!("bf16")
+            && !crate::sme::available()
         {
             return Bf16::Bfmmla;
         }
@@ -486,7 +489,9 @@ pub(crate) mod bf16dot {
     /// One MR x 32 tile: per k pair, broadcast each row's (a[2q], a[2q+1]) and multiply-add it into both column
     /// vectors. `kp` is k rounded up to even; `a` rows are bf16 with stride `lda`.
     #[inline(always)]
-    unsafe fn tile<const MR: usize>(kp: usize, a: *const u16, lda: usize, panel: *const u16, c: *mut f32, ldc: usize, ncols: usize) {
+    unsafe fn tile<const MR: usize>(
+        kp: usize, a: *const u16, lda: usize, panel: *const u16, c: *mut f32, ldc: usize, ncols: usize,
+    ) {
         let mut acc = [[_mm512_setzero_ps(); 2]; MR];
         for q in 0..kp / 2 {
             let b0: __m512bh = transmute(_mm512_loadu_si512(panel.add(q * 2 * NRW) as *const __m512i));
@@ -609,8 +614,8 @@ pub(crate) mod amx {
     /// contiguous 1 KB block.
     #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn gemm_block(
-        m: usize, kp: usize, a: *const u16, lda: usize, tiled: bool, w: *const u16, pstride: usize, np: usize, ncols: usize,
-        c: *mut f32, ldc: usize,
+        m: usize, kp: usize, a: *const u16, lda: usize, tiled: bool, w: *const u16, pstride: usize, np: usize,
+        ncols: usize, c: *mut f32, ldc: usize,
     ) {
         // Configure the tiles once per thread and keep them configured.
         thread_local!(static CONFIGURED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
@@ -1386,8 +1391,9 @@ pub(crate) fn gemm_packed(m: usize, a: &[f32], lda: usize, w: &Packed, c: &mut [
     Split::balanced(m, n, k, nrw, pmr * 8).run(|t| {
         let (ap, wp, cp) = (ap, wp, cp);
         // SAFETY: bounds checked above; tasks write disjoint (row block, column range) regions of C.
-        let (a, w, c) =
-            unsafe { (ap.0.add(t.i0 * lda) as *const f32, wp.0.add(t.p0 * k * nrw) as *const u16, cp.0.add(t.i0 * ldc + t.j0)) };
+        let (a, w, c) = unsafe {
+            (ap.0.add(t.i0 * lda) as *const f32, wp.0.add(t.p0 * k * nrw) as *const u16, cp.0.add(t.i0 * ldc + t.j0))
+        };
         dispatch!(gemm_packed_block(t.rows, k, a, lda, w, t.np, t.ncols, c, ldc))
     });
 }
@@ -1410,7 +1416,8 @@ fn gemm_pairs(m: usize, a: &[f32], lda: usize, w: &Packed, c: &mut [f32], ldc: u
                 bf16dot::round_rows(m, k, a.as_ptr(), lda, a16.as_mut_ptr(), kp)
             }
         };
-        let (ap, wp, cp) = (SendPtr(a16.as_ptr() as *mut u16), SendPtr(w.data.as_ptr() as *mut u16), SendPtr(c.as_mut_ptr()));
+        let (ap, wp, cp) =
+            (SendPtr(a16.as_ptr() as *mut u16), SendPtr(w.data.as_ptr() as *mut u16), SendPtr(c.as_mut_ptr()));
         split.run(|t| {
             let (ap, wp, cp) = (ap, wp, cp);
             // SAFETY: tasks write disjoint (row block, column range) regions of C; the CPU (and, for AMX, the OS)
@@ -1444,14 +1451,17 @@ fn gemm_quads(m: usize, a: &[f32], lda: usize, w: &Packed, c: &mut [f32], ldc: u
         let round = |(t, dst): (usize, &mut [u16])| {
             let (r0, ap0) = (t * bfmmla::MR, ap0);
             // SAFETY: gemm_packed checked the bounds of A; each tile of `a16` is written by one call.
-            unsafe { bfmmla::round_rows_tiled(bfmmla::MR.min(m - r0), k, ap0.0.add(r0 * lda), lda, dst.as_mut_ptr(), kq) }
+            unsafe {
+                bfmmla::round_rows_tiled(bfmmla::MR.min(m - r0), k, ap0.0.add(r0 * lda), lda, dst.as_mut_ptr(), kq)
+            }
         };
         if m * k < 1 << 16 {
             a16.chunks_mut(tile).enumerate().for_each(round);
         } else {
             a16.par_chunks_mut(tile).with_min_len((1 << 14) / tile + 1).enumerate().for_each(round);
         }
-        let (ap, wp, cp) = (SendPtr(a16.as_ptr() as *mut u16), SendPtr(w.data.as_ptr() as *mut u16), SendPtr(c.as_mut_ptr()));
+        let (ap, wp, cp) =
+            (SendPtr(a16.as_ptr() as *mut u16), SendPtr(w.data.as_ptr() as *mut u16), SendPtr(c.as_mut_ptr()));
         split.run(|t| {
             let (ap, wp, cp) = (ap, wp, cp);
             // SAFETY: tasks write disjoint (row block, column range) regions of C; `bf16_mode` checked the CPU has BF16.
@@ -1479,8 +1489,7 @@ fn check_gemm<W>(m: usize, n: usize, k: usize, a: &[f32], lda: usize, b: &[W], l
 /// C[m, n] (+)= A[m, k] B[n, k]^T on the calling thread. B rows are f32 or bf16 (u16 bits).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gemm_serial<W: Elem>(
-    m: usize, n: usize, k: usize, a: &[f32], lda: usize, b: &[W], ldb: usize, c: &mut [f32], ldc: usize,
-    acc: bool,
+    m: usize, n: usize, k: usize, a: &[f32], lda: usize, b: &[W], ldb: usize, c: &mut [f32], ldc: usize, acc: bool,
 ) {
     check_gemm(m, n, k, a, lda, b, ldb, c, ldc);
     if m == 0 || n == 0 {
@@ -1609,7 +1618,19 @@ mod speed {
     #[ignore]
     fn gemm_speed() {
         // the model's shapes for a 128-token text: q|k|v, gate|up, down, o; then larger m for comparison
-        for &(m, n, k) in &[(128, 2048, 512), (128, 4096, 512), (128, 512, 2048), (128, 512, 1024), (512, 2048, 512), (512, 512, 2048), (16, 2048, 512), (2340, 768, 768), (2340, 3072, 768), (2340, 768, 3072), (540, 3072, 768)] {
+        for &(m, n, k) in &[
+            (128, 2048, 512),
+            (128, 4096, 512),
+            (128, 512, 2048),
+            (128, 512, 1024),
+            (512, 2048, 512),
+            (512, 512, 2048),
+            (16, 2048, 512),
+            (2340, 768, 768),
+            (2340, 3072, 768),
+            (2340, 768, 3072),
+            (540, 3072, 768),
+        ] {
             let a = vec![0.5f32; m * k];
             let w = Packed::new(&vec![0x3f80u16; n * k], n, k);
             let mut c = vec![0.0f32; m * n];

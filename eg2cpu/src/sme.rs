@@ -266,7 +266,8 @@ pub(crate) fn gemm_packed(m: usize, a: &[f32], lda: usize, w: &Packed, c: &mut [
     let (n, k) = (w.n, w.k);
     let panels = n.div_ceil(NRW);
     let groups = task_target(m, n, k, TASK_FLOPS).div_ceil(m.div_ceil(32)).clamp(1, panels);
-    let (ap, wp, cp) = (SendPtr(a.as_ptr() as *mut f32), SendPtr(w.data().as_ptr() as *mut u16), SendPtr(c.as_mut_ptr()));
+    let (ap, wp, cp) =
+        (SendPtr(a.as_ptr() as *mut f32), SendPtr(w.data().as_ptr() as *mut u16), SendPtr(c.as_mut_ptr()));
     Split::new(m, n, NRW, 32, panels.div_ceil(groups)).run(|t| {
         let (ap, wp, cp) = (ap, wp, cp);
         let mut buf = STRIP.take();
@@ -275,8 +276,19 @@ pub(crate) fn gemm_packed(m: usize, a: &[f32], lda: usize, w: &Packed, c: &mut [
         // regions of C.
         unsafe {
             transpose(ap.0.add(t.i0 * lda), lda, t.rows, k, buf.as_mut_ptr(), 32);
-            strip(k, buf.as_ptr(), 128, t.rows, wp.0.add(t.p0 * k * NRW) as *const u8, 64, k * NRW * 2, t.ncols,
-                  cp.0.add(t.i0 * ldc + t.j0), ldc, Mode { bf16: true, transposed: false })
+            strip(
+                k,
+                buf.as_ptr(),
+                128,
+                t.rows,
+                wp.0.add(t.p0 * k * NRW) as *const u8,
+                64,
+                k * NRW * 2,
+                t.ncols,
+                cp.0.add(t.i0 * ldc + t.j0),
+                ldc,
+                Mode { bf16: true, transposed: false },
+            )
         }
         STRIP.set(buf);
     });
@@ -320,12 +332,34 @@ pub(crate) fn attention(qkv: &[f32], ld: usize, t: usize, nh: usize, hd: usize, 
         // SAFETY: qt/kt hold hd rows of t per head; s holds t rows of 32; v rows are in bounds by the assert; the
         // task writes rows q0..q0 + rows of head h's column band, disjoint from every other task.
         unsafe {
-            strip(hd, qt.as_ptr().add(h * hd * t + q0), t * 4, rows, kt.as_ptr().add(h * hd * t) as *const u8, t * 4,
-                  128, t, s.as_mut_ptr(), 32, Mode { bf16: false, transposed: true });
+            strip(
+                hd,
+                qt.as_ptr().add(h * hd * t + q0),
+                t * 4,
+                rows,
+                kt.as_ptr().add(h * hd * t) as *const u8,
+                t * 4,
+                128,
+                t,
+                s.as_mut_ptr(),
+                32,
+                Mode { bf16: false, transposed: true },
+            );
             let sums = softmax_cols(&mut s[..t * 32]);
             let dst = op.0.add(q0 * d + h * hd);
-            strip(t, s.as_ptr(), 128, rows, qkv.as_ptr().add(2 * d + h * hd) as *const u8, ld * 4, 128, hd, dst, d,
-                  Mode { bf16: false, transposed: false });
+            strip(
+                t,
+                s.as_ptr(),
+                128,
+                rows,
+                qkv.as_ptr().add(2 * d + h * hd) as *const u8,
+                ld * 4,
+                128,
+                hd,
+                dst,
+                d,
+                Mode { bf16: false, transposed: false },
+            );
             for (r, sum) in sums.iter().enumerate().take(rows) {
                 let inv = 1.0 / sum;
                 std::slice::from_raw_parts_mut(dst.add(r * d), hd).iter_mut().for_each(|x| *x *= inv);
@@ -349,7 +383,9 @@ mod tests {
         let d = nh * hd;
         for t in [1usize, 5, 45, 97] {
             let qkv: Vec<f32> = (0..t * 3 * d).map(|i| ((i * 7919 % 1013) as f32 / 1013.0 - 0.5) * 2.0).collect();
-            let part = |i: usize| -> Vec<f32> { qkv.chunks_exact(3 * d).flat_map(|r| &r[i * d..(i + 1) * d]).copied().collect() };
+            let part = |i: usize| -> Vec<f32> {
+                qkv.chunks_exact(3 * d).flat_map(|r| &r[i * d..(i + 1) * d]).copied().collect()
+            };
             let want = crate::model::attention(&part(0), &part(1), &part(2), t, nh, nh, hd, None);
             let (mut qkt, mut got) = (vec![0.0f32; 2 * d * t], vec![f32::NAN; t * d]);
             attention(&qkv, 3 * d, t, nh, hd, &mut qkt, &mut got);
@@ -383,13 +419,35 @@ mod speed {
             let (h, q0) = (i % nh, (i / nh) % (t / 32) * 32);
             unsafe {
                 let a = Instant::now();
-                strip(hd, qt.as_ptr().add(h * hd * t + q0), t * 4, 32, qt.as_ptr().add(h * hd * t) as *const u8, t * 4, 128, t,
-                      s.as_mut_ptr(), 32, Mode { bf16: false, transposed: true });
+                strip(
+                    hd,
+                    qt.as_ptr().add(h * hd * t + q0),
+                    t * 4,
+                    32,
+                    qt.as_ptr().add(h * hd * t) as *const u8,
+                    t * 4,
+                    128,
+                    t,
+                    s.as_mut_ptr(),
+                    32,
+                    Mode { bf16: false, transposed: true },
+                );
                 let b = Instant::now();
                 let sums = softmax_cols(&mut s);
                 let c = Instant::now();
-                strip(t, s.as_ptr(), 128, 32, qkv.as_ptr().add(2 * d + h * hd) as *const u8, 3 * d * 4, 128, hd,
-                      out.as_mut_ptr().add(q0 * d + h * hd), d, Mode { bf16: false, transposed: false });
+                strip(
+                    t,
+                    s.as_ptr(),
+                    128,
+                    32,
+                    qkv.as_ptr().add(2 * d + h * hd) as *const u8,
+                    3 * d * 4,
+                    128,
+                    hd,
+                    out.as_mut_ptr().add(q0 * d + h * hd),
+                    d,
+                    Mode { bf16: false, transposed: false },
+                );
                 let e = Instant::now();
                 std::hint::black_box(sums);
                 tqk += (b - a).as_secs_f64();
@@ -399,8 +457,15 @@ mod speed {
         }
         let us = |x: f64| x / iters as f64 * 1e6;
         let fl = 2.0 * 32.0 * t as f64 * hd as f64;
-        println!("per task (t={t}): QK {:.2} us ({:.0} GFLOP/s), softmax {:.2} us, PV {:.2} us ({:.0} GFLOP/s); {} tasks/layer",
-                 us(tqk), fl / (tqk / iters as f64) / 1e9, us(tsm), us(tpv), fl / (tpv / iters as f64) / 1e9, nh * t.div_ceil(32));
+        println!(
+            "per task (t={t}): QK {:.2} us ({:.0} GFLOP/s), softmax {:.2} us, PV {:.2} us ({:.0} GFLOP/s); {} tasks/layer",
+            us(tqk),
+            fl / (tqk / iters as f64) / 1e9,
+            us(tsm),
+            us(tpv),
+            fl / (tpv / iters as f64) / 1e9,
+            nh * t.div_ceil(32)
+        );
         let (mut qkt, mut out) = (vec![0.0f32; 2 * d * t], vec![0.0f32; t * d]);
         let a = Instant::now();
         for _ in 0..20 {

@@ -4,10 +4,12 @@
 use eg2cpu::Model;
 use serde_json::Value;
 
-/// The default checkpoint, or None (with a SKIPPED line on stderr) when there is none, as in CI.
+/// The default checkpoint, or None (with a SKIPPED line on stderr) when there is none. With `EG2_REQUIRE_MODEL` set, as
+/// in CI, a missing checkpoint fails the test instead.
 pub fn model_or_skip(test: &str) -> Option<Model> {
     match Model::load_default() {
         Ok(m) => Some(m),
+        Err(e) if std::env::var_os("EG2_REQUIRE_MODEL").is_some() => panic!("{test}: no checkpoint ({e:#})"),
         Err(e) => {
             eprintln!("SKIPPED {test}: no checkpoint found ({e:#})");
             None

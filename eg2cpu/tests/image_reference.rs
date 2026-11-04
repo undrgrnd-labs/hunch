@@ -11,12 +11,14 @@ use serde_json::Value;
 fn matches_pytorch_image_reference() {
     let Some(model) = common::model_or_skip("matches_pytorch_image_reference") else { return };
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/");
-    let fixture: Value = serde_json::from_str(&std::fs::read_to_string(format!("{dir}image_reference.json")).unwrap()).unwrap();
+    let fixture: Value =
+        serde_json::from_str(&std::fs::read_to_string(format!("{dir}image_reference.json")).unwrap()).unwrap();
     let captions: Vec<&str> = fixture["captions"].as_array().unwrap().iter().map(|c| c.as_str().unwrap()).collect();
     let text_embs: Vec<Vec<f32>> = captions.iter().map(|c| model.embed(c).unwrap().embedding).collect();
     let d = model.cfg.hidden;
     let mut lowest = 1.0f32;
-    for (case, want_sims) in fixture["cases"].as_array().unwrap().iter().zip(fixture["similarity"].as_array().unwrap()) {
+    for (case, want_sims) in fixture["cases"].as_array().unwrap().iter().zip(fixture["similarity"].as_array().unwrap())
+    {
         let file = case["file"].as_str().unwrap();
         let budget = case["max_soft_tokens"].as_u64().unwrap() as usize;
         let bytes = std::fs::read(format!("{dir}{file}")).unwrap();
@@ -68,11 +70,16 @@ fn matches_pytorch_image_reference() {
             img.width,
             sum as i64 - want_sum as i64
         );
-        // Lossless images match to fp32 rounding. JPEG decoders differ by a few pixel levels, and bf16 matmuls (EG2_BF16)
-        // round the activations through both towers (a synthetic gradient can fall to cosine 0.9998), so those get a
-        // looser bar.
+        // Lossless images match to fp32 rounding. bf16 matmuls (EG2_BF16) round the activations through both towers (a
+        // synthetic gradient can fall to cosine 0.9998), so they get a looser bar. JPEG decoders differ by a few pixel
+        // levels, and by how many depends on the platform (jpeg-decoder's x86-64 and Arm paths differ from each other as
+        // well as from libjpeg-turbo), so the drift bar is looser still there; the cosine bar is the same.
         let exact = lossless && eg2cpu::bf16_mode() == eg2cpu::Bf16::Off;
-        let (min_cos, max_drift) = if exact { (0.99999, 1e-3) } else { (0.9995, 2e-2) };
+        let (min_cos, max_drift) = match (exact, lossless) {
+            (true, _) => (0.99999, 1e-3),
+            (false, true) => (0.9995, 2e-2),
+            (false, false) => (0.9995, 5e-2),
+        };
         assert!(cos > min_cos, "{file}: embedding cosine {cos}");
         assert!(soft_err < max_drift && worst_layer < max_drift, "{file}: drift {soft_err} {worst_layer}");
         let argmax = |x: &[f32]| (0..x.len()).max_by(|&a, &b| x[a].total_cmp(&x[b])).unwrap();
@@ -90,7 +97,8 @@ fn photos_match_their_captions() {
     let Some(model) = common::model_or_skip("photos_match_their_captions") else { return };
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/images/");
     let photos = ["chelsea.png", "coffee.png", "astronaut.png", "rocket.jpg"];
-    let captions = ["a photo of a cat", "a cup of coffee", "an astronaut in a space suit", "a rocket on the launch pad"];
+    let captions =
+        ["a photo of a cat", "a cup of coffee", "an astronaut in a space suit", "a rocket on the launch pad"];
     let texts: Vec<Vec<f32>> = captions.iter().map(|c| model.embed(c).unwrap().embedding).collect();
     for (i, photo) in photos.iter().enumerate() {
         // the smallest budget is enough to tell them apart

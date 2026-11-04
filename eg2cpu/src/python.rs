@@ -72,7 +72,9 @@ impl PyModel {
     fn resume_batch<'py>(&self, py: Python<'py>, partials: Vec<Bound<'py, PyPartial>>) -> PyResult<Vec<Pair<'py>>> {
         let parts: Vec<Partial> = partials
             .iter()
-            .map(|p| p.get().inner.lock().unwrap().take().ok_or_else(|| PyRuntimeError::new_err("partial already resumed")))
+            .map(|p| {
+                p.get().inner.lock().unwrap().take().ok_or_else(|| PyRuntimeError::new_err("partial already resumed"))
+            })
             .collect::<PyResult<_>>()?;
         let outs = py.detach(|| self.inner.resume_batch(parts));
         Ok(outs.into_iter().map(|o| to_numpy(py, o)).collect())
@@ -83,7 +85,9 @@ impl PyModel {
     /// default, 70 is about 5x faster) and its soft tokens are encoded by the text tower, so the embedding shares the
     /// text embeddings' space.
     #[pyo3(signature = (image, max_soft_tokens=crate::DEFAULT_SOFT_TOKENS))]
-    fn embed_image<'py>(&self, py: Python<'py>, image: &Bound<'py, PyAny>, max_soft_tokens: usize) -> PyResult<Pair<'py>> {
+    fn embed_image<'py>(
+        &self, py: Python<'py>, image: &Bound<'py, PyAny>, max_soft_tokens: usize,
+    ) -> PyResult<Pair<'py>> {
         let bytes = match image.cast::<PyBytes>() {
             Ok(b) => b.as_bytes().to_vec(),
             Err(_) => {
@@ -143,9 +147,7 @@ impl PyModel {
     ) -> PyResult<Vec<Vec<Bound<'py, PyDict>>>> {
         let hs: Vec<&Handle> = handles.iter().map(|h| &h.get().inner).collect();
         let out = py.detach(|| self.inner.apply(&hs, &spans)).map_err(err)?;
-        out.into_iter()
-            .map(|row| row.into_iter().zip(&hs).map(|(v, h)| verdict_dict(py, h, v)).collect())
-            .collect()
+        out.into_iter().map(|row| row.into_iter().zip(&hs).map(|(v, h)| verdict_dict(py, h, v)).collect()).collect()
     }
 }
 
@@ -165,7 +167,8 @@ fn verdict_dict<'py>(py: Python<'py>, h: &Handle, v: Verdict) -> PyResult<Bound<
             // Per-level probabilities keyed by level index, the expected level as the score,
             // the top probability as confidence, and the legend.
             let probs: HashMap<String, f32> = v.p.iter().enumerate().map(|(i, q)| (i.to_string(), *q)).collect();
-            let legend: HashMap<String, &str> = h.labels.iter().enumerate().map(|(i, l)| (i.to_string(), l.as_str())).collect();
+            let legend: HashMap<String, &str> =
+                h.labels.iter().enumerate().map(|(i, l)| (i.to_string(), l.as_str())).collect();
             d.set_item("p", if v.p.is_empty() { None } else { Some(probs) })?;
             // "value" below carries the same number; Python callers may read either key.
             d.set_item("score", v.value)?;

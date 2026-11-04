@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The checkpoint revision examples/download.py pins; the directory is named after it, so `Model::revision` reports
+  # it as it would for the Hugging Face cache snapshot.
+  EG2_REVISION: 914f7f89142e33e77833254d9c9b90c3cef7303b
+  # model.safetensors' Git LFS object id: its SHA-256
+  EG2_WEIGHTS_SHA256: 197a32965d4b1105faf060417baa899e193fb73cd401f42ec9295234d5553d79
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: eg2cpu
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  eg2cpu:
+    name: eg2cpu (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: eg2cpu
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: eg2cpu
+
+      # The 1.5 GB checkpoint, downloaded once per revision and kept in the Actions cache.
+      - name: Restore the checkpoint
+        id: model
+        uses: actions/cache@v4
+        with:
+          path: ~/eg2/${{ env.EG2_REVISION }}
+          key: embeddinggemma-2-${{ env.EG2_REVISION }}
+          enableCrossOsArchive: true
+
+      - name: Download the checkpoint
+        if: steps.model.outputs.cache-hit != 'true'
+        run: |
+          dir=~/eg2/$EG2_REVISION
+          mkdir -p "$dir"
+          for f in config.json tokenizer.json tokenizer_config.json model.safetensors; do
+            curl -fsSL --retry 5 -o "$dir/$f" "https://huggingface.co/google/embeddinggemma-2/resolve/$EG2_REVISION/$f"
+          done
+          echo "$EG2_WEIGHTS_SHA256  $dir/model.safetensors" | shasum -a 256 -c -
+
+      - name: Build
+        run: cargo build --release --all-targets
+
+      - name: Test (text, image and audio against the PyTorch fixtures)
+        run: EG2_MODEL_DIR=~/eg2/$EG2_REVISION cargo test --release
+        env:
+          EG2_REQUIRE_MODEL: "1"

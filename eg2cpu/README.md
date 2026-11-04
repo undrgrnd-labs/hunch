@@ -345,6 +345,11 @@ features, the soft tokens, the layer means and the embedding. The cases are thre
 the 30 s cap. Features agree to 5e-7, soft tokens and layer means to about 1e-6 relative, and embeddings have cosine
 ≥ 0.9999996, including on the NEON (`EG2_SME=off`) and scalar paths.
 
+Without a checkpoint these tests are skipped, unless `EG2_REQUIRE_MODEL` is set; then they fail. CI
+(`.github/workflows/ci.yml`) sets it and runs `cargo test --release` on Linux x86-64 and macOS arm64 against the
+checkpoint revision `examples/download.py` pins, kept in the Actions cache. It also checks `cargo fmt` (settings in
+`rustfmt.toml`).
+
 ```bash
 cargo test --release
 uv run scripts/make_reference.py tests/fixtures/reference.json   # regenerate the fixtures (needs torch)

@@ -189,9 +189,19 @@ fn main() -> Result<()> {
                     let per = (iters + 1) as f64;
                     let total: f64 = ops.iter().map(|o| o.1).sum::<f64>() / per;
                     for (name, secs, calls) in ops {
-                        println!("        {name:<16} {:>7.2} ms  {:>4.0}%  ({} calls/pass)", secs / per * 1e3, secs / per / total * 100.0, calls as f64 / per);
+                        println!(
+                            "        {name:<16} {:>7.2} ms  {:>4.0}%  ({} calls/pass)",
+                            secs / per * 1e3,
+                            secs / per / total * 100.0,
+                            calls as f64 / per
+                        );
                     }
-                    println!("        {:<16} {:>7.2} ms in traced ops, {:.2} ms elsewhere", "", total * 1e3, (dt - total) * 1e3);
+                    println!(
+                        "        {:<16} {:>7.2} ms in traced ops, {:.2} ms elsewhere",
+                        "",
+                        total * 1e3,
+                        (dt - total) * 1e3
+                    );
                 }
             }
             // Throughput when many texts are embedded at once (texts run concurrently).
@@ -251,7 +261,11 @@ fn main() -> Result<()> {
                     ops.sort_by(|a, b| b.1.total_cmp(&a.1));
                     let per = iters as f64;
                     for (name, secs, calls) in ops {
-                        println!("        {name:<22} {:>7.2} ms  ({} calls/image)", secs / per * 1e3, calls as f64 / per);
+                        println!(
+                            "        {name:<22} {:>7.2} ms  ({} calls/image)",
+                            secs / per * 1e3,
+                            calls as f64 / per
+                        );
                     }
                 }
             }
@@ -303,7 +317,11 @@ fn main() -> Result<()> {
                     ops.sort_by(|a, b| b.1.total_cmp(&a.1));
                     let per = iters as f64;
                     for (name, secs, calls) in ops {
-                        println!("        {name:<22} {:>7.2} ms  ({} calls/clip)", secs / per * 1e3, calls as f64 / per);
+                        println!(
+                            "        {name:<22} {:>7.2} ms  ({} calls/clip)",
+                            secs / per * 1e3,
+                            calls as f64 / per
+                        );
                     }
                 }
             }

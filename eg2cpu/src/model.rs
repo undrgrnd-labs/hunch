@@ -188,9 +188,9 @@ pub fn default_model_dir() -> Result<PathBuf> {
         return Ok(PathBuf::from(d));
     }
     let hub = std::env::var("HF_HUB_CACHE").map(PathBuf::from).unwrap_or_else(|_| {
-        let home = std::env::var("HF_HOME").map(PathBuf::from).unwrap_or_else(|_| {
-            PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache/huggingface")
-        });
+        let home = std::env::var("HF_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache/huggingface"));
         home.join("hub")
     });
     let snaps = hub.join("models--google--embeddinggemma-2/snapshots");
@@ -210,7 +210,10 @@ impl Model {
         for f in ["config.json", "tokenizer.json", "model.safetensors"] {
             if !dir.join(f).is_file() {
                 let from = if std::env::var_os("EG2_MODEL_DIR").is_some() { " (EG2_MODEL_DIR)" } else { "" };
-                return Err(anyhow!("no EmbeddingGemma 2 checkpoint in {}{from}: {f} is missing; {GET_IT}", dir.display()));
+                return Err(anyhow!(
+                    "no EmbeddingGemma 2 checkpoint in {}{from}: {f} is missing; {GET_IT}",
+                    dir.display()
+                ));
             }
         }
         let json: Value = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
@@ -494,9 +497,12 @@ impl Model {
     pub fn resume_batch(&self, partials: Vec<Partial>) -> Vec<Output> {
         let lens: Vec<usize> = partials.iter().map(|p| p.t).collect();
         let slots: Vec<Mutex<Option<Partial>>> = partials.into_iter().map(|p| Mutex::new(Some(p))).collect();
-        run_bounded(slots.len(), max_in_flight(), |i| lens[i], |i| {
-            self.resume_in_pool(slots[i].lock().unwrap().take().expect("each partial resumed once"))
-        })
+        run_bounded(
+            slots.len(),
+            max_in_flight(),
+            |i| lens[i],
+            |i| self.resume_in_pool(slots[i].lock().unwrap().take().expect("each partial resumed once")),
+        )
     }
 
     /// Tokenize and run each text up to layer `upto` (see `forward_batch_partial`).
@@ -614,9 +620,7 @@ impl Model {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn layer_forward(
-        &self, l: &Layer, h: &mut [f32], ple: &[f32], rope: &Rope, window: Option<usize>, t: usize,
-    ) {
+    fn layer_forward(&self, l: &Layer, h: &mut [f32], ple: &[f32], rope: &Rope, window: Option<usize>, t: usize) {
         let cfg = &self.cfg;
         let (d, eps, nh, hd, kvh) = (cfg.hidden, cfg.eps, cfg.heads, l.spec.head_dim, l.spec.kv_heads);
         let (qd, kvd, inter, pd) = (nh * hd, kvh * hd, cfg.intermediate, cfg.ple_dim);
@@ -635,19 +639,24 @@ impl Model {
         });
         // Per-head norms and RoPE for q and k, and v's plain norm, in one pass over positions.
         trace("qkv norm+rope", || {
-            q.par_chunks_mut(qd).zip(k.par_chunks_mut(kvd)).zip(v.par_chunks_mut(kvd)).with_min_len(32).enumerate().for_each(|(pos, ((q, k), v))| {
-                for head in q.chunks_exact_mut(hd) {
-                    rmsnorm(head, Some(&l.q_norm), eps);
-                    rope.apply(head, pos);
-                }
-                for head in k.chunks_exact_mut(hd) {
-                    rmsnorm(head, Some(&l.k_norm), eps);
-                    rope.apply(head, pos);
-                }
-                for head in v.chunks_exact_mut(hd) {
-                    rmsnorm(head, None, eps);
-                }
-            })
+            q.par_chunks_mut(qd)
+                .zip(k.par_chunks_mut(kvd))
+                .zip(v.par_chunks_mut(kvd))
+                .with_min_len(32)
+                .enumerate()
+                .for_each(|(pos, ((q, k), v))| {
+                    for head in q.chunks_exact_mut(hd) {
+                        rmsnorm(head, Some(&l.q_norm), eps);
+                        rope.apply(head, pos);
+                    }
+                    for head in k.chunks_exact_mut(hd) {
+                        rmsnorm(head, Some(&l.k_norm), eps);
+                        rope.apply(head, pos);
+                    }
+                    for head in v.chunks_exact_mut(hd) {
+                        rmsnorm(head, None, eps);
+                    }
+                })
         });
         let attn = trace("attention", || attention(&q, &k, &v, t, nh, kvh, hd, window));
         let mut o = vec![0.0f32; t * d];
@@ -662,7 +671,9 @@ impl Model {
             gemm_packed(t, &x, d, &l.w_gate, &mut g, inter);
             gemm_packed(t, &x, d, &l.w_up, &mut u, inter);
         });
-        trace("gelu", || g.par_chunks_mut(inter).zip(u.par_chunks(inter)).with_min_len(16).for_each(|(g, u)| gelu_mul(g, u)));
+        trace("gelu", || {
+            g.par_chunks_mut(inter).zip(u.par_chunks(inter)).with_min_len(16).for_each(|(g, u)| gelu_mul(g, u))
+        });
         trace("gemm down", || gemm_packed(t, &g, inter, &l.w_down, &mut o, d));
         trace("norm+add", || add_norm(h, &mut o, &l.post_ff_ln, d, eps));
 
@@ -726,7 +737,11 @@ fn pool_for(tokens: usize) -> Option<&'static rayon::ThreadPool> {
     let sizes = SIZES.get_or_init(|| {
         std::env::var("EG2_POOLS")
             .ok()
-            .and_then(|v| v.split(',').map(|p| p.split_once(':').and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?)))).collect())
+            .and_then(|v| {
+                v.split(',')
+                    .map(|p| p.split_once(':').and_then(|(a, b)| Some((a.parse().ok()?, b.parse().ok()?))))
+                    .collect()
+            })
             .unwrap_or_else(default_pools)
     });
     static POOLS: OnceLock<Vec<rayon::ThreadPool>> = OnceLock::new();
@@ -865,7 +880,9 @@ fn attention_on_amx() -> (bool, bool) {
 /// Bidirectional multi-head attention with grouped KV heads; `window` limits |q - k| (inclusive).
 /// q: [t, nh*hd], k/v: [t, kvh*hd] -> [t, nh*hd]. Attention scaling is 1.0 (q and k are RMS-normed).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn attention(q: &[f32], k: &[f32], v: &[f32], t: usize, nh: usize, kvh: usize, hd: usize, window: Option<usize>) -> Vec<f32> {
+pub(crate) fn attention(
+    q: &[f32], k: &[f32], v: &[f32], t: usize, nh: usize, kvh: usize, hd: usize, window: Option<usize>,
+) -> Vec<f32> {
     const QB: usize = 32;
     let (qd, kvd, groups) = (nh * hd, kvh * hd, nh / kvh);
     #[cfg(target_arch = "x86_64")]
@@ -944,8 +961,19 @@ fn attention_amx(
             // SAFETY: rows r0..r1 of head hh are in bounds; AMX availability was checked by bf16_mode.
             unsafe {
                 bf16dot::round_rows(rows, hd, q.as_ptr().add(r0 * qd + hh * hd), qd, q16.as_mut_ptr(), hdp);
-                amx::gemm_block(rows, hdp, q16.as_ptr(), hdp, false, kp[g].as_ptr().add(ka0 / 32 * hdp * 32), hdp * 32,
-                                skn / 32, skn, s.as_mut_ptr(), skn);
+                amx::gemm_block(
+                    rows,
+                    hdp,
+                    q16.as_ptr(),
+                    hdp,
+                    false,
+                    kp[g].as_ptr().add(ka0 / 32 * hdp * 32),
+                    hdp * 32,
+                    skn / 32,
+                    skn,
+                    s.as_mut_ptr(),
+                    skn,
+                );
             }
         } else {
             gemm_serial(rows, skn, hd, &q[r0 * qd + hh * hd..], qd, &k[k0 * kvd + g * hd..], kvd, &mut s, skn, false);
@@ -961,8 +989,19 @@ fn attention_amx(
         // SAFETY: p16 holds 32 rows of pkn; each task writes rows r0..r1 of head hh's column band, never overlapping.
         unsafe {
             bf16dot::round_rows(rows, skn, s.as_ptr(), skn, p16.as_mut_ptr().add(sk0 - ka0), pkn);
-            amx::gemm_block(rows, pkn, p16.as_ptr(), pkn, false, vp[g].as_ptr().add(ka0 * 32), tp * 32, hdp / 32, hd,
-                            outp.0.add(r0 * qd + hh * hd), qd);
+            amx::gemm_block(
+                rows,
+                pkn,
+                p16.as_ptr(),
+                pkn,
+                false,
+                vp[g].as_ptr().add(ka0 * 32),
+                tp * 32,
+                hdp / 32,
+                hd,
+                outp.0.add(r0 * qd + hh * hd),
+                qd,
+            );
         }
     });
     out
@@ -998,7 +1037,8 @@ pub(crate) struct Rope {
 impl Rope {
     pub(crate) fn new(theta: f64, dim: usize, t: usize) -> Self {
         let half = dim / 2;
-        let inv: Vec<f32> = (0..half).map(|i| (1.0 / theta.powf(((2 * i) as f32 / dim as f32) as f64)) as f32).collect();
+        let inv: Vec<f32> =
+            (0..half).map(|i| (1.0 / theta.powf(((2 * i) as f32 / dim as f32) as f64)) as f32).collect();
         let (mut cos, mut sin) = (Vec::with_capacity(t * half), Vec::with_capacity(t * half));
         for p in 0..t {
             for &f in &inv {
@@ -1055,7 +1095,9 @@ pub(crate) fn add_norm(h: &mut [f32], o: &mut [f32], post: &[f32], d: usize, eps
 }
 
 /// `add_norm`, then the next block's input x = norm(h) with weights `pre`, in one pass over the rows.
-pub(crate) fn add_norm_then_norm(h: &mut [f32], o: &mut [f32], post: &[f32], x: &mut [f32], pre: &[f32], d: usize, eps: f32) {
+pub(crate) fn add_norm_then_norm(
+    h: &mut [f32], o: &mut [f32], post: &[f32], x: &mut [f32], pre: &[f32], d: usize, eps: f32,
+) {
     h.par_chunks_mut(d).zip(o.par_chunks_mut(d)).zip(x.par_chunks_mut(d)).with_min_len(64).for_each(|((h, o), x)| {
         rmsnorm(o, Some(post), eps);
         h.iter_mut().zip(o.iter()).for_each(|(a, b)| *a += b);

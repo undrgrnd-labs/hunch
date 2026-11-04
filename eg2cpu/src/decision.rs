@@ -82,7 +82,15 @@ pub struct Verdict {
 
 impl Verdict {
     fn not_applicable() -> Self {
-        Self { status: Status::NotApplicable, answer: None, p: vec![], value: None, z: vec![], distance: None, prompt: None }
+        Self {
+            status: Status::NotApplicable,
+            answer: None,
+            p: vec![],
+            value: None,
+            z: vec![],
+            distance: None,
+            prompt: None,
+        }
     }
 }
 
@@ -465,7 +473,12 @@ fn f32s(v: &Value, what: &str) -> Result<Vec<f32>> {
     v.as_array()
         .with_context(|| format!("{what}: expected a list"))?
         .iter()
-        .map(|x| x.as_f64().map(|x| x as f32).filter(|x| x.is_finite()).with_context(|| format!("{what}: expected finite numbers")))
+        .map(|x| {
+            x.as_f64()
+                .map(|x| x as f32)
+                .filter(|x| x.is_finite())
+                .with_context(|| format!("{what}: expected finite numbers"))
+        })
         .collect()
 }
 
@@ -494,8 +507,10 @@ impl Handle {
             Some("levels") => Kind::Levels,
             k => bail!("unknown kind {k:?}"),
         };
-        let labels: Vec<String> =
-            m["labels"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+        let labels: Vec<String> = m["labels"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default();
         let readout = match &m["readout"]["layer"] {
             Value::String(s) if s == "final" => Readout::Final,
             Value::Number(n) => Readout::Layer(n.as_u64().context("readout.layer")? as usize),
@@ -535,7 +550,10 @@ impl Handle {
                 (1, 1)
             }
         };
-        ensure!(cal_w.len() == outputs && cal_b.len() == biases && cal_w.iter().all(|r| r.len() == k), "calibration shape mismatch");
+        ensure!(
+            cal_w.len() == outputs && cal_b.len() == biases && cal_w.iter().all(|r| r.len() == k),
+            "calibration shape mismatch"
+        );
         let abstain = match (&m["abstain"], take(&t, "abstain_mean")?, take(&t, "abstain_whiten")?) {
             (Value::Object(a), Some((_, mean)), Some((wshape, whiten))) => {
                 ensure!(mean.len() == dim && wshape == [dim, dim], "abstain tensors must be [dim] and [dim, dim]");
@@ -564,7 +582,10 @@ impl Handle {
                 let prompt = Template::parse(e["prompt"].as_str().context("escalate.prompt")?)?;
                 // Every field the prompt names must be one the unit has, so an escalate verdict always has a prompt.
                 for f in prompt.fields() {
-                    ensure!(f == "unit" || unit.fields().any(|u| u == f), "escalate.prompt names {{{f}}}, which the unit template lacks");
+                    ensure!(
+                        f == "unit" || unit.fields().any(|u| u == f),
+                        "escalate.prompt names {{{f}}}, which the unit template lacks"
+                    );
                 }
                 Some(Escalation { rule, prompt })
             }
@@ -623,7 +644,8 @@ impl Handle {
                 // Proportional odds: P(level <= k) = sigmoid(theta_k - a z).
                 let eta = self.cal_w[0][0] * z[0];
                 let cum: Vec<f32> = self.cal_b.iter().map(|t| sigmoid(t - eta)).chain([1.0]).collect();
-                let p: Vec<f32> = cum.iter().enumerate().map(|(i, c)| c - if i == 0 { 0.0 } else { cum[i - 1] }).collect();
+                let p: Vec<f32> =
+                    cum.iter().enumerate().map(|(i, c)| c - if i == 0 { 0.0 } else { cum[i - 1] }).collect();
                 let expected = p.iter().enumerate().map(|(i, q)| i as f32 * q).sum();
                 (Some(self.labels[argmax(&p)].clone()), p, Some(expected))
             }
@@ -758,7 +780,9 @@ mod tests {
         assert!(t(r#"not (span.tool == "read" or span.missing == "x")"#));
         assert!(t(r#"span.missing != "x" and span.missing not in ["a"]"#));
         assert!(!t(r#"span.missing contains "x""#));
-        for bad in ["span.kind ==", "span.kind = 'x'", "(span.kind == 'x'", "span.kind in 'x'", "span.kind == 'x' extra"] {
+        for bad in
+            ["span.kind ==", "span.kind = 'x'", "(span.kind == 'x'", "span.kind in 'x'", "span.kind == 'x' extra"]
+        {
             assert!(Gate::parse(bad).is_err(), "{bad} should not parse");
         }
     }
@@ -767,7 +791,10 @@ mod tests {
     fn templates() {
         let s = span(&[("call", "bash: ls"), ("output", "a b")]);
         assert_eq!(Template::parse("{call}\n{output}").unwrap().render(&s, None).as_deref(), Some("bash: ls\na b"));
-        assert_eq!(Template::parse("{{literal}} {span.call}").unwrap().render(&s, None).as_deref(), Some("{literal} bash: ls"));
+        assert_eq!(
+            Template::parse("{{literal}} {span.call}").unwrap().render(&s, None).as_deref(),
+            Some("{literal} bash: ls")
+        );
         assert_eq!(Template::parse("{unit}!").unwrap().render(&s, Some(("unit", "u"))).as_deref(), Some("u!"));
         assert!(Template::parse("{text}").unwrap().render(&s, None).is_none());
         assert!(Template::parse("{call").is_err());
@@ -784,7 +811,9 @@ mod tests {
         assert!(!t("span.a == span.missing") && t("span.a != span.missing") && !t("span.a contains span.missing"));
         assert!(t("span.a == x") && !t("span.a == span.x"));
         // booleans match in any case: Python's str(True) is "True"
-        assert!(t("span.flag == true") && t(r#"span.flag == "true""#) && t("span.flag == True") && !t("span.flag == false"));
+        assert!(
+            t("span.flag == true") && t(r#"span.flag == "true""#) && t("span.flag == True") && !t("span.flag == false")
+        );
         assert!(t("span.off == false") && t("span.flag in [true]") && !t("span.flag != true"));
         assert!(t("span.flag == span.flag") && !t(r#"span.a == "X""#));
     }
@@ -794,7 +823,8 @@ mod tests {
         let mut header = serde_json::json!({"__metadata__": {"handle": meta.to_string()}});
         let (mut data, mut off) = (Vec::new(), 0);
         for (name, shape, v) in tensors {
-            header[*name] = serde_json::json!({"dtype": "F32", "shape": shape, "data_offsets": [off, off + 4 * v.len()]});
+            header[*name] =
+                serde_json::json!({"dtype": "F32", "shape": shape, "data_offsets": [off, off + 4 * v.len()]});
             data.extend(v.iter().flat_map(|x| x.to_le_bytes()));
             off += 4 * v.len();
         }
@@ -838,9 +868,11 @@ mod tests {
         }
         let with_header = |h: &str| [&(h.len() as u64).to_le_bytes()[..], h.as_bytes()].concat();
         assert!(Handle::from_bytes(&u64::MAX.to_le_bytes()).is_err());
-        for t in [r#"{"directions":{"dtype":"F32","shape":[1,1],"data_offsets":[0,18446744073709551615]}}"#,
-                  r#"{"directions":{"dtype":"F32","shape":[4294967296,4294967296,4],"data_offsets":[0,0]}}"#,
-                  r#"{"directions":{"dtype":"F32","shape":[1,1],"data_offsets":[4,0]}}"#] {
+        for t in [
+            r#"{"directions":{"dtype":"F32","shape":[1,1],"data_offsets":[0,18446744073709551615]}}"#,
+            r#"{"directions":{"dtype":"F32","shape":[4294967296,4294967296,4],"data_offsets":[0,0]}}"#,
+            r#"{"directions":{"dtype":"F32","shape":[1,1],"data_offsets":[4,0]}}"#,
+        ] {
             assert!(err(Handle::from_bytes(&with_header(t))).contains("directions: "), "{t}");
         }
         assert!(err(load(&boolean_meta(), vec![1, 0])).contains("non-zero"));

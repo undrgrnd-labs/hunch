@@ -7,7 +7,8 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 #[test]
 fn concurrent_callers_get_their_own_results() {
     let Some(model) = common::model_or_skip("concurrent_callers_get_their_own_results") else { return };
-    let base = model.tokenize(&"The agent called read_file, got an error, and retried the same call. ".repeat(80)).unwrap();
+    let base =
+        model.tokenize(&"The agent called read_file, got an error, and retried the same call. ".repeat(80)).unwrap();
     // Distinct texts of varied length (offset and length differ per request).
     let text = |i: usize| &base[i % 13..i % 13 + [7, 30, 90, 200][i % 4]];
     let want: Vec<Vec<f32>> = (0..56).map(|i| model.forward_batch_with(&[text(i)], 1).remove(0).embedding).collect();

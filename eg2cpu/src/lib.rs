@@ -19,7 +19,9 @@ pub use audio::{AudioConfig, MAX_SAMPLES, SAMPLE_RATE, decode_wav, frames_for, l
 pub use decision::{CmpOp, FORMAT, Gate, Handle, Kind, Operand, Readout, Span, Status, Template, Verdict};
 pub use model::{Config, LayerSpec, MAX_TOKENS, Model, Output, Partial, default_model_dir, max_in_flight, take_trace};
 pub use simd::{Bf16, Isa, bf16_mode, isa};
-pub use vision::{DEFAULT_SOFT_TOKENS, Rgb, SOFT_TOKEN_BUDGETS, VisionConfig, decode as decode_image, resize as resize_image};
+pub use vision::{
+    DEFAULT_SOFT_TOKENS, Rgb, SOFT_TOKEN_BUDGETS, VisionConfig, decode as decode_image, resize as resize_image,
+};
 
 #[cfg(feature = "python")]
 mod python;

@@ -58,7 +58,10 @@ impl<'a> Tensors<'a> {
                 .iter()
                 .map(|x| x.as_u64().map(|x| x as usize).with_context(|| format!("{name}: shape")))
                 .collect::<Result<Vec<_>>>()?;
-            let off = v["data_offsets"].as_array().filter(|o| o.len() == 2).with_context(|| format!("{name}: data_offsets"))?;
+            let off = v["data_offsets"]
+                .as_array()
+                .filter(|o| o.len() == 2)
+                .with_context(|| format!("{name}: data_offsets"))?;
             let at = |i: usize| {
                 off[i]
                     .as_u64()
@@ -67,7 +70,8 @@ impl<'a> Tensors<'a> {
             };
             let (start, end) = (at(0)?, at(1)?);
             let bytes = |s: usize| shape.iter().try_fold(s, |n, &d| n.checked_mul(d));
-            let size_ok = dtype_size(&dtype).is_none_or(|s| bytes(s).is_some_and(|b| Some(b) == end.checked_sub(start)));
+            let size_ok =
+                dtype_size(&dtype).is_none_or(|s| bytes(s).is_some_and(|b| Some(b) == end.checked_sub(start)));
             ensure!(start <= end && end <= buf.len() && size_ok, "{name}: bad data offsets");
             index.insert(name.clone(), Entry { dtype, shape, start, end });
         }
@@ -123,7 +127,13 @@ impl<'a> Tensors<'a> {
 
     /// A bf16 tensor widened to f32.
     pub(crate) fn bf16_f32(&self, name: &str, shape: &[usize]) -> Result<Vec<f32>> {
-        Ok(self.bytes(name, "BF16", shape)?.as_chunks::<2>().0.iter().map(|&b| bf16_to_f32(u16::from_le_bytes(b))).collect())
+        Ok(self
+            .bytes(name, "BF16", shape)?
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&b| bf16_to_f32(u16::from_le_bytes(b)))
+            .collect())
     }
 
     /// An f32 tensor.
