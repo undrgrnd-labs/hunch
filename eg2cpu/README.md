@@ -4,8 +4,8 @@ CPU inference for the EmbeddingGemma 2 encoder (`google/embeddinggemma-2`), in R
 images through the checkpoint's vision tower, and audio through its audio tower. It uses bf16 weights and fp32 math.
 Kernels are picked at runtime: AVX-512, AVX2+FMA, NEON, or a scalar fallback. On Apple M4 and later the matmuls run on
 the SME matrix unit, still in fp32. On Intel CPUs with AMX, `EG2_BF16=amx` runs the matmuls and attention in bf16 on AMX
-tiles instead. On other Arm CPUs with BF16 (Neoverse V2 / Graviton 4), `EG2_BF16=bfmmla` runs the weight matmuls in bf16
-with `BFMMLA`.
+tiles instead. On Arm Linux CPUs with BF16 and no SME (Neoverse V2 and N2, the DGX Spark's Cortex-X925), the matmuls
+and attention run in bf16 with `BFMMLA` by default, 3-4x faster than fp32 on Neoverse N2; `EG2_BF16=off` keeps fp32.
 
 The text tower is loaded up front. The vision tower is loaded by the first image, and the audio tower by the first
 audio clip. A forward pass returns:
@@ -312,8 +312,8 @@ method, the requested method and the reason.
 |---|---|---|
 | `EG2_MODEL_DIR` | the HF cache snapshot | where the checkpoint is |
 | `EG2_ISA` | detected | `scalar`, `avx2`, `avx512` or `neon`: caps the ISA, to test the fallback paths |
-| `EG2_BF16` | `off` | `amx`: bf16 matmuls on AMX tiles. `dot`: AVX-512 BF16 dot products (slower than fp32 on current CPUs). `bfmmla`: bf16 weight matmuls with Arm `BFMMLA`, where SME is not in use (slower than fp32 NEON on Apple silicon, see [performance](../docs/performance.md)) |
-| `EG2_BF16_ATTN` | `all` | with `EG2_BF16=amx`: which attention products run on AMX (`all`, `pv` or `off`) |
+| `EG2_BF16` | `bfmmla` on Arm Linux with BF16 and no SME; else `off` | `amx`: bf16 matmuls on AMX tiles. `dot`: AVX-512 BF16 dot products (slower than fp32 on current CPUs). `bfmmla`: bf16 matmuls with Arm `BFMMLA`, where SME is not in use (slower than fp32 NEON on Apple silicon, see [performance](../docs/performance.md)). `off`: fp32 |
+| `EG2_BF16_ATTN` | `all` | with `EG2_BF16=amx` or `bfmmla`: which attention products run in bf16 (`all`, `pv` or `off`) |
 | `EG2_SME` | on where available | `off`: NEON matmuls on CPUs with SME (Apple M4 and later) |
 | `EG2_POOLS` | with SME `128:4,320:8,640:10`; else from the core count | thread pools for single texts by length (tokens:threads); longer texts use the whole pool. Without SME, texts up to 40 tokens get half the performance cores and up to 160 all of them, at least 8 and 12 threads: `40:8,160:12` on an M5 Pro with `EG2_SME=off`, `40:8,160:16` (so 160 tokens use the whole pool) on 16 Neoverse V2 cores |
 | `EG2_VISION_THREADS` | with SME, performance cores + 2; else all | threads for the vision and audio towers |

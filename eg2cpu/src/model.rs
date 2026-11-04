@@ -859,14 +859,15 @@ pub(crate) fn trace<R>(name: &'static str, f: impl FnOnce() -> R) -> R {
 
 // ---------------------------------------------------------------- kernels
 
-/// Which attention products run on AMX in `EG2_BF16=amx` mode, as (Q K^T, P V). Both by default: the embeddings stay
-/// within cosine 0.99999 of the fp32 reference, and batches are faster than with P V alone. `EG2_BF16_ATTN=pv` keeps
-/// Q K^T in fp32, `EG2_BF16_ATTN=off` keeps both.
-#[cfg(target_arch = "x86_64")]
-fn attention_on_amx() -> (bool, bool) {
+/// Which attention products run in bf16 in `EG2_BF16=amx` or `bfmmla` mode, as (Q K^T, P V). Both by default: the
+/// embeddings stay within cosine 0.99999 of the fp32 reference, and batches are faster than with P V alone.
+/// `EG2_BF16_ATTN=pv` keeps Q K^T in fp32, `EG2_BF16_ATTN=off` keeps both.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+fn attention_in_bf16() -> (bool, bool) {
+    use crate::simd::{Bf16, bf16_mode};
     static M: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
     *M.get_or_init(|| {
-        if crate::simd::bf16_mode() != crate::simd::Bf16::Amx {
+        if !matches!(bf16_mode(), Bf16::Amx | Bf16::Bfmmla) {
             return (false, false);
         }
         match std::env::var("EG2_BF16_ATTN").as_deref() {
@@ -886,8 +887,12 @@ pub(crate) fn attention(
     const QB: usize = 32;
     let (qd, kvd, groups) = (nh * hd, kvh * hd, nh / kvh);
     #[cfg(target_arch = "x86_64")]
-    if let (amx_qk, true) = attention_on_amx() {
+    if let (amx_qk, true) = attention_in_bf16() {
         return attention_amx(q, k, v, t, nh, kvh, hd, window, amx_qk);
+    }
+    #[cfg(target_arch = "aarch64")]
+    if let (bf16_qk, true) = attention_in_bf16() {
+        return attention_bfmmla(q, k, v, t, nh, kvh, hd, window, bf16_qk);
     }
     // V transposed per KV head to [hd, t] so P V is another A B^T product.
     let mut vt = vec![0.0f32; kvh * hd * t];
@@ -1007,6 +1012,85 @@ fn attention_amx(
     out
 }
 
+/// `attention` with P V (and, if `bf16_qk`, Q K^T) on `BFMMLA`, as `attention_amx` does on AMX tiles: keys in
+/// 8-aligned ranges (whole panels) around each query block's window, the extra columns masked out with the window; K
+/// and V^T packed per KV head once.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+fn attention_bfmmla(
+    q: &[f32], k: &[f32], v: &[f32], t: usize, nh: usize, kvh: usize, hd: usize, window: Option<usize>, bf16_qk: bool,
+) -> Vec<f32> {
+    use crate::simd::{bfmmla, pack_quads};
+    const QB: usize = 32;
+    const NRW: usize = bfmmla::NRW;
+    let (qd, kvd, groups) = (nh * hd, kvh * hd, nh / kvh);
+    // keys padded to whole panels; V^T's k (keys) and K's k (head dims) to groups of four
+    let tp = t.next_multiple_of(NRW);
+    let hdq = hd.next_multiple_of(4);
+    // V^T per KV head: hd output columns over the keys. K per KV head (for Q K^T): keys as columns over hd.
+    let vp: Vec<Vec<u16>> =
+        (0..kvh).map(|g| pack_quads(tp, hd, |key, c| if key < t { v[key * kvd + g * hd + c] } else { 0.0 })).collect();
+    let kp: Vec<Vec<u16>> = if bf16_qk {
+        (0..kvh).map(|g| pack_quads(hd, t, |d, key| k[key * kvd + g * hd + d])).collect()
+    } else {
+        vec![]
+    };
+    let mut out = vec![0.0f32; t * qd];
+    let outp = OutPtr(out.as_mut_ptr());
+    let nqb = t.div_ceil(QB);
+    (0..nh * nqb).into_par_iter().for_each(|task| {
+        let (hh, qb) = (task / nqb, task % nqb);
+        let g = hh / groups;
+        let (r0, r1) = (qb * QB, ((qb + 1) * QB).min(t));
+        let (k0, k1) = match window {
+            Some(w) => (r0.saturating_sub(w), (r1 - 1 + w + 1).min(t)),
+            None => (0, t),
+        };
+        let (ka0, ka1) = (k0 / NRW * NRW, k1.next_multiple_of(NRW));
+        let (rows, pkn) = (r1 - r0, ka1 - ka0);
+        // scores over keys ka0..ka1 in both cases; in fp32 only the exact range k0..k1 is computed
+        let mut s = vec![0.0f32; rows * pkn];
+        if bf16_qk {
+            let mut q16 = vec![0u16; QB * hdq];
+            // SAFETY: rows r0..r1 of head hh are in bounds; `bf16_mode` checked the CPU has BF16.
+            unsafe {
+                bfmmla::round_rows_tiled(rows, hd, q.as_ptr().add(r0 * qd + hh * hd), qd, q16.as_mut_ptr(), hdq);
+                let ldw = hdq * NRW;
+                let w = kp[g].as_ptr().add(ka0 / NRW * ldw);
+                bfmmla::gemm_block(rows, hdq, q16.as_ptr(), w, ldw, pkn / NRW, pkn, s.as_mut_ptr(), pkn);
+            }
+        } else {
+            let at = &mut s[k0 - ka0..];
+            gemm_serial(rows, k1 - k0, hd, &q[r0 * qd + hh * hd..], qd, &k[k0 * kvd + g * hd..], kvd, at, pkn, false);
+        }
+        for (i, row) in s.chunks_exact_mut(pkn).enumerate() {
+            let (lo, hi) = key_range(r0 + i, k0, k1, window);
+            softmax_range(row, lo - ka0, hi - ka0);
+        }
+        let mut p16 = vec![0u16; QB * pkn];
+        #[allow(clippy::redundant_locals)]
+        let outp = outp;
+        // SAFETY: p16 holds QB rows of pkn; each task writes rows r0..r1 of head hh's column band, never overlapping.
+        unsafe {
+            bfmmla::round_rows_tiled(rows, pkn, s.as_ptr(), pkn, p16.as_mut_ptr(), pkn);
+            let ldw = tp * NRW;
+            let w = vp[g].as_ptr().add(ka0 * NRW);
+            bfmmla::gemm_block(
+                rows,
+                pkn,
+                p16.as_ptr(),
+                w,
+                ldw,
+                hd.div_ceil(NRW),
+                hd,
+                outp.0.add(r0 * qd + hh * hd),
+                qd,
+            );
+        }
+    });
+    out
+}
+
 /// The keys query `qi` attends to, within the block's key range [k0, k1): |key - qi| <= window.
 fn key_range(qi: usize, k0: usize, k1: usize, window: Option<usize>) -> (usize, usize) {
     match window {
@@ -1113,4 +1197,64 @@ fn mean_rows(x: &[f32], d: usize) -> Vec<f32> {
         m.iter_mut().zip(row).for_each(|(a, b)| *a += *b as f64);
     }
     m.into_iter().map(|v| (v / t as f64) as f32).collect()
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+mod tests {
+    use super::*;
+
+    /// Plain fp32 attention: softmax over |q - k| <= window of q . k, then the weighted sum of v.
+    #[allow(clippy::too_many_arguments)]
+    fn naive(
+        q: &[f32], k: &[f32], v: &[f32], t: usize, nh: usize, kvh: usize, hd: usize, w: Option<usize>,
+    ) -> Vec<f32> {
+        let (qd, kvd) = (nh * hd, kvh * hd);
+        let mut out = vec![0.0f32; t * qd];
+        for h in 0..nh {
+            let g = h / (nh / kvh);
+            for i in 0..t {
+                let (lo, hi) = key_range(i, 0, t, w);
+                let s: Vec<f64> = (lo..hi)
+                    .map(|j| (0..hd).map(|d| q[i * qd + h * hd + d] as f64 * k[j * kvd + g * hd + d] as f64).sum())
+                    .collect();
+                let m = s.iter().cloned().fold(f64::MIN, f64::max);
+                let e: Vec<f64> = s.iter().map(|x| (x - m).exp()).collect();
+                let z: f64 = e.iter().sum();
+                for d in 0..hd {
+                    let o: f64 = (lo..hi).zip(&e).map(|(j, p)| p / z * v[j * kvd + g * hd + d] as f64).sum();
+                    out[i * qd + h * hd + d] = o as f32;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn bfmmla_attention_matches_fp32() {
+        if !std::arch::is_aarch64_feature_detected!("bf16") {
+            return;
+        }
+        let mut seed = 1u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 8) as f32 / (1 << 24) as f32 - 0.5
+        };
+        // lengths around the 8-key panels and 32-query blocks, grouped KV heads, with and without a window
+        for (t, nh, kvh, hd, w) in
+            [(5, 2, 1, 16, None), (45, 4, 2, 64, None), (77, 4, 1, 32, Some(9)), (40, 2, 2, 20, Some(32))]
+        {
+            let (q, k, v): (Vec<f32>, Vec<f32>, Vec<f32>) = (
+                (0..t * nh * hd).map(|_| rnd()).collect(),
+                (0..t * kvh * hd).map(|_| rnd()).collect(),
+                (0..t * kvh * hd).map(|_| rnd()).collect(),
+            );
+            let want = naive(&q, &k, &v, t, nh, kvh, hd, w);
+            for bf16_qk in [false, true] {
+                let got = attention_bfmmla(&q, &k, &v, t, nh, kvh, hd, w, bf16_qk);
+                let err = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                // bf16 inputs carry about 3 significant digits; the outputs are averages of values in [-0.5, 0.5]
+                assert!(err < 4e-3, "t {t} nh {nh} kvh {kvh} hd {hd} window {w:?} bf16_qk {bf16_qk}: max |d| {err}");
+            }
+        }
+    }
 }

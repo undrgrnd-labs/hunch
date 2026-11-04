@@ -416,11 +416,14 @@ pub(crate) mod arm {
 // ---------------------------------------------------------------- bf16 matmuls
 
 /// How matmuls multiply in bf16, if at all. Activations are rounded to bf16 too, so results differ from the fp32
-/// reference by more than 1e-3 and it is opt-in: `EG2_BF16=amx` (AMX tiles, `tdpbf16ps`), `EG2_BF16=dot`
-/// (AVX-512 BF16 `vdpbf16ps`, which issues on one port where fp32 FMAs issue on two, so it gains nothing on current
-/// CPUs), or on Arm `EG2_BF16=bfmmla` (`BFMMLA` 2 x 4 by 4 x 2 matrix products, where the SME kernels are not in
-/// use). `amx` falls back to `dot` where AMX is unavailable but AVX-512 BF16 is present; a request the CPU can't
-/// honour gives `Off`.
+/// reference by more than 1e-3: `EG2_BF16=amx` (AMX tiles, `tdpbf16ps`), `EG2_BF16=dot` (AVX-512 BF16 `vdpbf16ps`,
+/// which issues on one port where fp32 FMAs issue on two, so it gains nothing on current CPUs), or on Arm
+/// `EG2_BF16=bfmmla` (`BFMMLA` 2 x 4 by 4 x 2 matrix products, where the SME kernels are not in use). `amx` falls back
+/// to `dot` where AMX is unavailable but AVX-512 BF16 is present; a request the CPU can't honour gives `Off`.
+///
+/// On x86 and macOS they are opt-in. On Arm Linux with BF16 and no SME (Neoverse V2 and N2 servers, DGX Spark's
+/// Cortex-X925 and A725) `bfmmla` is the default, as on Graviton 4 `BFMMLA` runs at four times the fp32 rate per core;
+/// `EG2_BF16=off` keeps fp32. macOS stays opt-in: Apple's cores run `BFMMLA` at half their fp32 rate.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Bf16 {
     Off,
@@ -445,7 +448,7 @@ pub fn bf16_mode() -> Bf16 {
         // SME matmuls take precedence: with `sme::available`, `bfmmla` is ignored.
         #[cfg(target_arch = "aarch64")]
         if isa() == Isa::Neon
-            && want == "bfmmla"
+            && (want == "bfmmla" || (want.is_empty() && cfg!(target_os = "linux")))
             && std::arch::is_aarch64_feature_detected!("bf16")
             && !crate::sme::available()
         {
@@ -687,6 +690,14 @@ pub(crate) fn pack_pairs(k: usize, n: usize, at: impl Fn(usize, usize) -> f32 + 
     pack_panels(n, k, bf16dot::NRW, Layout::Pairs, |c, kk| f32_to_bf16(at(kk, c)))
 }
 
+/// Pack `n` output columns over `k`, value `at(kk, c)` for k index `kk` and column `c`, into `BFMMLA` panels
+/// (`Layout::Quads`): `bfmmla::NRW` columns per panel, each `k.next_multiple_of(4)` long, k in groups of four,
+/// zero-padded.
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn pack_quads(k: usize, n: usize, at: impl Fn(usize, usize) -> f32 + Sync) -> Vec<u16> {
+    pack_panels(n, k, bfmmla::NRW, Layout::Quads, |c, kk| f32_to_bf16(at(kk, c)))
+}
+
 /// Arm `BFMMLA`: one instruction multiplies a 2 x 4 bf16 block of A (two rows, four k) by a 4 x 2 block of W^T (four
 /// k, two columns) into a 2 x 2 fp32 block. Weights are packed in panels of `NRW` columns, k in groups of four, each
 /// column pair's 2 x 4 block one 16-byte vector; A is rounded into the same shape per `MR`-row tile.
@@ -783,15 +794,16 @@ pub(crate) mod bfmmla {
         }
     }
 
-    /// C[m, cols] = A[m, kq] W^T over `np` consecutive packed panels covering `ncols` columns, with `a` in tile order
-    /// (`round_rows_tiled`).
+    /// C[m, cols] = A[m, kq] W^T over `np` packed panels `ldw` apart covering `ncols` columns, with `a` in tile order
+    /// (`round_rows_tiled`). `ldw` is `kq * NRW` for whole panels; it is larger when `w` starts partway into longer
+    /// panels (a range of k, as attention's P V takes a range of keys).
     #[target_feature(enable = "neon,bf16")]
     #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn gemm_block(
-        m: usize, kq: usize, a: *const u16, w: *const u16, np: usize, ncols: usize, c: *mut f32, ldc: usize,
+        m: usize, kq: usize, a: *const u16, w: *const u16, ldw: usize, np: usize, ncols: usize, c: *mut f32, ldc: usize,
     ) {
         for pi in 0..np {
-            let (panel, nc, cc) = (w.add(pi * kq * NRW), (ncols - pi * NRW).min(NRW), c.add(pi * NRW));
+            let (panel, nc, cc) = (w.add(pi * ldw), (ncols - pi * NRW).min(NRW), c.add(pi * NRW));
             let mut i = 0;
             while i < m {
                 tile(kq, a.add(i * kq), panel, cc.add(i * ldc), ldc, MR.min(m - i), nc);
@@ -1467,7 +1479,7 @@ fn gemm_quads(m: usize, a: &[f32], lda: usize, w: &Packed, c: &mut [f32], ldc: u
             // SAFETY: tasks write disjoint (row block, column range) regions of C; `bf16_mode` checked the CPU has BF16.
             unsafe {
                 let (ab, wb, cb) = (ap.0.add(t.i0 * kq), wp.0.add(t.p0 * kq * nrw), cp.0.add(t.i0 * ldc + t.j0));
-                bfmmla::gemm_block(t.rows, kq, ab, wb, t.np, t.ncols, cb, ldc)
+                bfmmla::gemm_block(t.rows, kq, ab, wb, kq * nrw, t.np, t.ncols, cb, ldc)
             }
         });
     });
