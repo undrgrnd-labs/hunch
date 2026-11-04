@@ -11,6 +11,10 @@
 //!                                              280): decode + resize, vision tower, text tower, and the whole
 //!                                              `embed_image_with`
 //! eg2 image-embed <file>...                    print one JSON embedding per image (280 soft tokens)
+//! eg2 audio <file.wav> [seconds...]            time embedding the clip cut (or repeated) to each length (default 5 10
+//!                                              30): log-mel features, audio tower, text tower, and the whole
+//!                                              `embed_audio_samples`
+//! eg2 audio-embed <file.wav>...                print one JSON embedding per clip
 //!
 //! "cores busy" is process CPU time over wall time: how many cores the run kept busy on average.
 
@@ -20,7 +24,8 @@ use std::time::Instant;
 
 const USAGE: &str = "usage: eg2 embed <text>... | eg2 bench [tokens...] | eg2 batch <texts> <tokens> <in-flight>... | \
                      eg2 callers <threads> <reqs> <tokens> | eg2 mixed <threads> <reqs> <tokens> | \
-                     eg2 exit <layer> [tokens...] | eg2 image <file> [budgets...] | eg2 image-embed <file>...";
+                     eg2 exit <layer> [tokens...] | eg2 image <file> [budgets...] | eg2 image-embed <file>... | \
+                     eg2 audio <file.wav> [seconds...] | eg2 audio-embed <file.wav>...";
 
 /// User + system CPU seconds used by this process so far (0 where getrusage isn't available).
 fn cpu_secs() -> f64 {
@@ -72,6 +77,8 @@ enum Cmd {
     Exit { upto: usize, lens: Vec<usize> },
     Image { path: String, budgets: Vec<usize> },
     ImageEmbed(Vec<String>),
+    Audio { path: String, seconds: Vec<usize> },
+    AudioEmbed(Vec<String>),
 }
 
 fn number(what: &str, a: &str) -> Result<usize> {
@@ -131,6 +138,15 @@ fn parse(args: &[String]) -> Result<Cmd> {
             },
         },
         "image-embed" => Cmd::ImageEmbed(rest(args, 1, "file")?.to_vec()),
+        "audio" => Cmd::Audio {
+            path: arg(args, 1, "file")?.to_string(),
+            seconds: if args.len() > 2 {
+                args[2..].iter().map(|a| positive("seconds", a)).collect::<Result<_>>()?
+            } else {
+                vec![5, 10, 30]
+            },
+        },
+        "audio-embed" => Cmd::AudioEmbed(rest(args, 1, "file")?.to_vec()),
         other => bail!("unknown subcommand {other:?}"),
     })
 }
@@ -238,6 +254,64 @@ fn main() -> Result<()> {
                         println!("        {name:<22} {:>7.2} ms  ({} calls/image)", secs / per * 1e3, calls as f64 / per);
                     }
                 }
+            }
+        }
+        Cmd::Audio { path, seconds } => {
+            let clip = eg2cpu::decode_wav(&std::fs::read(&path).with_context(|| path.clone())?)?;
+            ensure!(!clip.is_empty(), "{path}: no samples");
+            let t = Instant::now();
+            model.embed_audio_samples(&clip)?;
+            println!("first clip (loads the audio tower): {:.0} ms", t.elapsed().as_secs_f64() * 1e3);
+            eg2cpu::take_trace();
+            for &secs in &seconds {
+                let n = secs * eg2cpu::SAMPLE_RATE as usize;
+                let samples: Vec<f32> = clip.iter().copied().cycle().take(n).collect();
+                model.embed_audio_samples(&samples)?; // warm-up
+                eg2cpu::take_trace();
+                let iters = (60 / secs).clamp(3, 20);
+                let (mut fe, mut aud, mut txt, mut all) = (vec![], vec![], vec![], vec![]);
+                let (c0, w0) = (cpu_secs(), Instant::now());
+                for _ in 0..iters {
+                    let t = Instant::now();
+                    let mel = eg2cpu::log_mel(&samples);
+                    let t1 = Instant::now();
+                    let soft = model.audio_soft_tokens(&mel)?;
+                    let t2 = Instant::now();
+                    std::hint::black_box(model.embed_audio_soft_tokens(&soft));
+                    let t3 = Instant::now();
+                    fe.push((t1 - t).as_secs_f64() * 1e3);
+                    aud.push((t2 - t1).as_secs_f64() * 1e3);
+                    txt.push((t3 - t2).as_secs_f64() * 1e3);
+                    all.push((t3 - t).as_secs_f64() * 1e3);
+                }
+                let cores = (cpu_secs() - c0) / w0.elapsed().as_secs_f64();
+                for v in [&mut fe, &mut aud, &mut txt, &mut all] {
+                    v.sort_by(f64::total_cmp);
+                }
+                println!(
+                    "{secs:>3} s ({} soft tokens): {:>7.1} ms/clip (p50; min {:.1})  = features {:.1} + audio {:.1} + text {:.1}  ({cores:.1} cores busy)",
+                    eg2cpu::soft_tokens_for(n),
+                    quantile(&all, 0.5),
+                    all[0],
+                    quantile(&fe, 0.5),
+                    quantile(&aud, 0.5),
+                    quantile(&txt, 0.5),
+                );
+                // EG2_TRACE=1: per op, averaged over the iterations.
+                let mut ops = eg2cpu::take_trace();
+                if !ops.is_empty() {
+                    ops.sort_by(|a, b| b.1.total_cmp(&a.1));
+                    let per = iters as f64;
+                    for (name, secs, calls) in ops {
+                        println!("        {name:<22} {:>7.2} ms  ({} calls/clip)", secs / per * 1e3, calls as f64 / per);
+                    }
+                }
+            }
+        }
+        Cmd::AudioEmbed(paths) => {
+            for path in &paths {
+                let bytes = std::fs::read(path).with_context(|| path.clone())?;
+                println!("{}", serde_json::to_string(&model.embed_audio(&bytes)?.embedding)?);
             }
         }
         Cmd::ImageEmbed(paths) => {

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use numpy::ndarray::Array2;
-use numpy::{IntoPyArray, PyArray1, PyArray2};
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
@@ -27,7 +27,7 @@ fn to_numpy(py: Python<'_>, out: Output) -> Pair<'_> {
     (out.embedding.into_pyarray(py), means_array(&out.layer_means).into_pyarray(py))
 }
 
-/// EmbeddingGemma 2 encoder on CPU, for text and images. `path` is the model snapshot directory; by default
+/// EmbeddingGemma 2 encoder on CPU, for text, images and audio. `path` is the model snapshot directory; by default
 /// `$EG2_MODEL_DIR`, else the Hugging Face cache snapshot of `google/embeddinggemma-2`.
 #[pyclass(name = "Model", module = "eg2cpu", frozen)]
 struct PyModel {
@@ -93,6 +93,31 @@ impl PyModel {
         };
         let out = py.detach(|| self.inner.embed_image_with(&bytes, max_soft_tokens)).map_err(err)?;
         Ok(to_numpy(py, out))
+    }
+
+    /// `(embedding[768], layer_means[24, 512])` for one audio clip: a WAV file (PCM or float, 16 kHz; channels are
+    /// averaged) given as bytes or a path, or 16 kHz mono samples as a 1-D array: float32 in [-1, 1], or int16 (16-bit
+    /// PCM, scaled by 1/32768 as a 16-bit WAV is). At most the first 30 s are used. Other formats and sampling rates need
+    /// converting first (e.g. with soundfile or ffmpeg).
+    fn embed_audio<'py>(&self, py: Python<'py>, audio: &Bound<'py, PyAny>) -> PyResult<Pair<'py>> {
+        let slice_err = |e: numpy::AsSliceError| PyRuntimeError::new_err(e.to_string());
+        let out = if let Ok(samples) = audio.extract::<PyReadonlyArray1<f32>>() {
+            let samples = samples.as_slice().map_err(slice_err)?.to_vec();
+            py.detach(|| self.inner.embed_audio_samples(&samples))
+        } else if let Ok(pcm) = audio.extract::<PyReadonlyArray1<i16>>() {
+            let samples: Vec<f32> = pcm.as_slice().map_err(slice_err)?.iter().map(|&v| v as f32 / 32768.0).collect();
+            py.detach(|| self.inner.embed_audio_samples(&samples))
+        } else {
+            let bytes = match audio.cast::<PyBytes>() {
+                Ok(b) => b.as_bytes().to_vec(),
+                Err(_) => {
+                    let path: PathBuf = audio.extract()?;
+                    std::fs::read(&path).map_err(|e| PyRuntimeError::new_err(format!("{}: {e}", path.display())))?
+                }
+            };
+            py.detach(|| self.inner.embed_audio(&bytes))
+        };
+        Ok(to_numpy(py, out.map_err(err)?))
     }
 
     /// Token ids with `<bos>`/`<eos>`, truncated to 1024.

@@ -1,4 +1,4 @@
-"""CPU (SIMD) inference for the EmbeddingGemma 2 encoder, text and images; no torch or transformers needed."""
+"""CPU (SIMD) inference for the EmbeddingGemma 2 encoder, text, images and audio; no torch or transformers needed."""
 
 import queue
 import threading

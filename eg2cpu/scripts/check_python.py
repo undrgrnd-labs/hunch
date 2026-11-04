@@ -13,15 +13,16 @@
 # [tool.uv.sources]
 # eg2cpu = { path = ".." }
 # ///
-"""Check the Python binding: against tests/fixtures/reference.json and image_reference.json, then against PyTorch fp32
-on CPU (the reference implementation, with hooks for the per-layer means) on 20 generated texts. Cosine must exceed
-0.99999.
+"""Check the Python binding: against tests/fixtures/reference.json, image_reference.json and audio_reference.json,
+then against PyTorch fp32 on CPU (the reference implementation, with hooks for the per-layer means) on 20 generated
+texts. Cosine must exceed 0.99999.
 
     uv run scripts/check_python.py
 """
 import json
 import random
 import time
+import wave
 from pathlib import Path
 
 import numpy as np
@@ -78,6 +79,19 @@ for case in json.loads((HERE / "tests/fixtures/image_reference.json").read_text(
     c = compare(f"{case['file']} ({case['max_soft_tokens']} soft tokens)", [*m, e], want)
     if path.suffix == ".png":
         worst = min(worst, c)
+
+print("vs tests/fixtures/audio_reference.json (torch fp32 CPU)")
+for case in json.loads((HERE / "tests/fixtures/audio_reference.json").read_text())["cases"]:
+    path = HERE / "tests/fixtures" / case["file"]
+    if case["repeat"] == 1:
+        e, m = emb.model.embed_audio(str(path))
+    else:  # a clip repeated past 30 s goes in as int16 samples (the repeated clips are 16-bit)
+        with wave.open(str(path)) as w:
+            pcm = np.frombuffer(w.readframes(w.getnframes()), np.int16)
+        e, m = emb.model.embed_audio(np.tile(pcm, case["repeat"]))
+    assert e.shape == (768,) and m.shape == (24, 512)
+    want = [np.array(x, dtype=np.float32) for x in case["layer_means"]] + [np.array(case["embedding"], dtype=np.float32)]
+    worst = min(worst, compare(f"{case['file']} x{case['repeat']}", [*m, e], want))
 
 sample = texts(random.Random(0), 20)
 t0 = time.perf_counter()
