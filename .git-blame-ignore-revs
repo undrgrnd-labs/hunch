@@ -1,0 +1,5 @@
+# Commits git blame skips: whole-file reformatting with no change in behaviour. GitHub reads this file; locally, run
+#   git config blame.ignoreRevsFile .git-blame-ignore-revs
+
+# Add CI and format eg2cpu with rustfmt
+bd4eb6f7b80263853fcff89ccf1c63bcd0b2501e
