@@ -1,13 +1,14 @@
 # eg2cpu
 
 CPU inference for the EmbeddingGemma 2 encoder (`google/embeddinggemma-2`), in Rust, with no GPU or PyTorch: text,
-and images through the checkpoint's vision tower. It uses bf16 weights and fp32 math. Kernels are picked at runtime:
-AVX-512, AVX2+FMA, NEON, or a scalar fallback. On Apple M4 and later the matmuls run on the SME matrix unit, still in
-fp32. On Intel CPUs with AMX, `EG2_BF16=amx` runs the matmuls and attention in bf16 on AMX tiles instead. On other Arm
-CPUs with BF16 (Neoverse V2 / Graviton 4), `EG2_BF16=bfmmla` runs the weight matmuls in bf16 with `BFMMLA`.
+images through the checkpoint's vision tower, and audio through its audio tower. It uses bf16 weights and fp32 math.
+Kernels are picked at runtime: AVX-512, AVX2+FMA, NEON, or a scalar fallback. On Apple M4 and later the matmuls run on
+the SME matrix unit, still in fp32. On Intel CPUs with AMX, `EG2_BF16=amx` runs the matmuls and attention in bf16 on AMX
+tiles instead. On other Arm CPUs with BF16 (Neoverse V2 / Graviton 4), `EG2_BF16=bfmmla` runs the weight matmuls in bf16
+with `BFMMLA`.
 
-The text tower is loaded up front. The vision tower is loaded by the first image; the audio tower is never read. A
-forward pass returns:
+The text tower is loaded up front. The vision tower is loaded by the first image, and the audio tower by the first
+audio clip. A forward pass returns:
 - the mean-pooled, L2-normalized 768-d embedding;
 - the mean-pooled 512-d residual stream after each of the 24 layers.
 
@@ -25,6 +26,7 @@ cargo run --release --bin eg2 -- bench               # single texts and batches
 cargo run --release --bin eg2 -- exit 8              # early exits vs the full pass
 cargo run --release --bin eg2 -- callers 8 60 32     # 8 concurrent callers, 60 requests each, 32 tokens
 cargo run --release --bin eg2 -- image photo.jpg     # image latency at 70, 140 and 280 soft tokens
+cargo run --release --bin eg2 -- audio speech.wav    # audio latency for 5, 10 and 30 s clips
 ```
 
 The checkpoint, `google/embeddinggemma-2`, is Apache-2.0 and not gated on the Hugging Face Hub (as of October 2026),
@@ -59,9 +61,42 @@ in the vision tower; without SME (`EG2_SME=off`) 248 ms and 1.2 s. The first ima
 170 ms. Per-step timings are in [../docs/performance.md](../docs/performance.md).
 
 **Not supported:**
-- audio and video;
+- video;
 - several images, or text and images interleaved, in one input;
 - formats other than PNG, JPEG and WebP (no GIF, HEIC or TIFF).
+
+## Audio
+
+```rust
+let out = model.embed_audio(&std::fs::read("speech.wav")?)?;   // WAV, 16 kHz; at most the first 30 s
+let out = model.embed_audio_samples(&samples)?;                // 16 kHz mono f32 samples in [-1, 1]
+out.embedding;                                                 // Vec<f32>, 768, in the same space as text
+```
+
+A clip goes through the same pipeline as `AutoProcessor` plus `EmbeddingGemma2Model` in transformers:
+1. **Features.** The samples are cut to 30 s. Every 10 ms, a 20 ms periodic-Hann window goes through a 512-point FFT,
+   128 HTK mel filters up to 8 kHz, and log(x + 0.001). The first window is centred on the first sample.
+2. **Audio tower.** Two stride-2 3 x 3 convolutions turn four mel frames into one, so there is a soft token per
+   40 ms (750 for 30 s). A 12-layer, 1024-wide conformer encodes them. Each layer has two half-step feed-forwards,
+   local attention over the frame and the 11 before it with relative positions and a soft cap, and a causal
+   depthwise convolution. The linear layers clamp their inputs and outputs to ranges stored in the checkpoint. The
+   output is projected to 1536 dimensions, RMS-normalized and projected to 512.
+3. **Text tower.** It encodes `<bos> <boa> soft tokens <eoa> <eos>`, as for images.
+
+Speech and text share one embedding space. In the test fixtures, each of three LibriSpeech utterances is nearest to
+its own transcript, at a cosine of 0.91-0.94, against 0.72-0.83 for the other transcripts.
+
+**Input formats.** Only what the model reads directly, so no codec libraries are needed:
+- WAV files: PCM at 8, 16, 24 or 32 bits, or IEEE float at 32 or 64 bits. Samples are scaled as soundfile reads them,
+  and channels are averaged.
+- Raw 16 kHz mono samples: `embed_audio_samples` in Rust; a float32 or int16 numpy array in Python.
+
+The sampling rate must be 16 kHz: other rates are refused, not resampled. Convert other formats first, for example
+`ffmpeg -i in.mp3 -ar 16000 -ac 1 out.wav`.
+
+On an Apple M5 Pro with SME, a 5 s clip takes about 87 ms, 10 s 141 ms and 30 s 419 ms, split roughly evenly between
+the audio tower and the text tower; without SME (`EG2_SME=off`) 177 ms at 5 s and 767 ms at 30 s. Computing the
+features takes under 2 ms. The first clip also loads the audio tower, about 280 ms.
 
 ## Python
 
@@ -75,6 +110,7 @@ model = eg2cpu.Model()                       # or Model("/path/to/snapshot"); sa
 emb, means = model.embed("bash: git status") # np.float32 arrays, shapes (768,) and (24, 512)
 pairs = model.embed_batch(texts)             # list of (emb, means), texts run concurrently on all cores
 emb, means = model.embed_image("photo.jpg")  # a path or bytes; max_soft_tokens=70 for speed
+emb, means = model.embed_audio("speech.wav") # a WAV path or bytes, or 16 kHz mono float32 / int16 samples
 eg2cpu.isa()                                 # "neon", "avx2", "avx512" or "scalar"
 ```
 
@@ -126,8 +162,8 @@ matmuls into tiles, attention by (head, 32-query block), and norms, RoPE and GEL
 - **Calls from inside the pool** (nested use) run directly. `forward_batch_with` runs a batch directly with an
   explicit bound, bypassing the scheduler.
 
-Images also bypass the request scheduler: each call runs at once, on a pool of the performance cores plus two
-(`EG2_VISION_THREADS`), so `EG2_MAX_IN_FLIGHT` doesn't bound images.
+Images and audio clips also bypass the request scheduler: each call runs at once, on a pool of the performance cores
+plus two (`EG2_VISION_THREADS`), so `EG2_MAX_IN_FLIGHT` doesn't bound them.
 
 `tests/concurrency.rs` checks that concurrent single and batch callers get results bit-identical to direct passes,
 and that a bad request panics only its own caller.
@@ -138,7 +174,8 @@ Once loaded, the text encoder's bf16 weights take 261 MB and the tokenizer about
 stays memory-mapped, so only the rows of tokens actually seen are read. The vision tower adds about 300 MB of packed
 weights, loaded on the first image; its 31 MB position table stays memory-mapped. Activations add about 30 MB per
 image at 70 soft tokens and 130 MB at 280. Peak footprint is 419 MB for text only, 762 MB after one image at 70 soft
-tokens, and 850 MB at 280. A forward pass in flight costs about 30 MB
+tokens, and 850 MB at 280. The audio tower adds about 580 MB of packed weights, loaded on the first clip; peak footprint
+is about 990 MB after a short clip and 1.18 GB after a 30 s one. A forward pass in flight costs about 30 MB
 at 512 tokens; `EG2_MAX_IN_FLIGHT` bounds how many are in flight. Measured footprints are in
 [../docs/performance.md](../docs/performance.md).
 
@@ -279,7 +316,7 @@ method, the requested method and the reason.
 | `EG2_BF16_ATTN` | `all` | with `EG2_BF16=amx`: which attention products run on AMX (`all`, `pv` or `off`) |
 | `EG2_SME` | on where available | `off`: NEON matmuls on CPUs with SME (Apple M4 and later) |
 | `EG2_POOLS` | with SME `128:4,320:8,640:10`; else from the core count | thread pools for single texts by length (tokens:threads); longer texts use the whole pool. Without SME, texts up to 40 tokens get half the performance cores and up to 160 all of them, at least 8 and 12 threads: `40:8,160:12` on an M5 Pro with `EG2_SME=off`, `40:8,160:16` (so 160 tokens use the whole pool) on 16 Neoverse V2 cores |
-| `EG2_VISION_THREADS` | with SME, performance cores + 2; else all | threads for the vision tower |
+| `EG2_VISION_THREADS` | with SME, performance cores + 2; else all | threads for the vision and audio towers |
 | `EG2_MAX_IN_FLIGHT` | thread count | forward passes in flight at once, process-wide; lower it to trade speed for memory |
 | `EG2_BATCH_WINDOW_US` | 1000 | how long a waiting caller gathers concurrent requests into one dispatch |
 | `EG2_LINGER_US` | 2000 | how long an idle dispatch worker waits for the next request before leaving |
@@ -302,10 +339,17 @@ pixels, the soft tokens, the layer means and the embedding, for four photos and 
 - JPEG: `jpeg-decoder` and PIL's libjpeg-turbo disagree on about 5% of decoded values, by a few levels, which gives
   cosine 0.99988 on the test photo.
 
+`tests/audio_reference.rs` does the same for audio, against PyTorch fp32 through `AutoProcessor`: the log-mel
+features, the soft tokens, the layer means and the embedding. The cases are three LibriSpeech utterances
+(validation-clean, CC BY 4.0) as 16-bit WAV, a stereo float WAV, a 0.3 s 24-bit tone, and an utterance repeated past
+the 30 s cap. Features agree to 5e-7, soft tokens and layer means to about 1e-6 relative, and embeddings have cosine
+≥ 0.9999996, including on the NEON (`EG2_SME=off`) and scalar paths.
+
 ```bash
 cargo test --release
 uv run scripts/make_reference.py tests/fixtures/reference.json   # regenerate the fixtures (needs torch)
 uv run scripts/make_image_reference.py tests/fixtures            # regenerate the image fixtures
+uv run scripts/make_audio_reference.py tests/fixtures            # regenerate the audio fixtures
 uv run scripts/check_python.py                                   # the Python binding against an inline torch reference
 uv run --package eg2cpu pytest -q eg2cpu/tests                   # the decisions compiler (from the repository root)
 ```
@@ -329,10 +373,12 @@ uv run --package eg2cpu pytest -q eg2cpu/tests                   # the decisions
   - final norm, mean pool, 512 -> 768 projection.
 - `src/vision.rs`: image decoding, the bit-exact resize, the vision tower (fused q/k/v and gate/up matmuls, 2-D
   RoPE), pooling and the projection into the text tower.
+- `src/audio.rs`: WAV decoding, log-mel features, the audio tower (subsampling convolutions, conformer layers with
+  clamped linears and local attention) and the projection into the text tower.
 - `src/sched.rs`: the process-wide request scheduler.
 - `src/decision.rs`: decision handles (loading, `applies_when` gates, unit templates, readout, calibration,
   abstain, escalate) and `Model::apply`. `python/eg2cpu/decisions.py` is the spec compiler.
 - `src/python.rs` (`python` feature) and `python/eg2cpu/`: the PyO3 module and the `Embedder` wrapper.
-- `src/bin/eg2.rs`: the `eg2` command-line tool (embed and benchmarks, `image` for image latency).
-- `scripts/`: reference fixtures for text and images, the Python binding check, and a PyTorch benchmark for
+- `src/bin/eg2.rs`: the `eg2` command-line tool (embed and benchmarks, `image` and `audio` for their latency).
+- `scripts/`: reference fixtures for text, images and audio, the Python binding check, and a PyTorch benchmark for
   comparison.

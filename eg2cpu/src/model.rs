@@ -1,8 +1,8 @@
 //! EmbeddingGemma 2 text encoder: weights, tokenizer, and the forward pass.
 //!
 //! Mirrors `transformers.models.embedding_gemma2.EmbeddingGemma2TextModel` (fp32 math over bf16 weights).
-//! The text tower is loaded up front; the vision tower (`vision.rs`) on the first image. The audio tower in the
-//! checkpoint is never read.
+//! The text tower is loaded up front; the vision tower (`vision.rs`) on the first image, the audio tower (`audio.rs`)
+//! on the first audio clip.
 
 use crate::simd::{Packed, bf16_to_f32, gelu_mul, gemm_packed, gemm_serial, softmax};
 use anyhow::{Context, Result, anyhow, bail, ensure};
@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+use crate::audio::{Audio, AudioConfig};
 use crate::sched::Scheduler;
 use crate::tensors::Tensors;
 use crate::vision::{DEFAULT_SOFT_TOKENS, Rgb, Vision, VisionConfig};
@@ -135,6 +136,10 @@ pub struct Model {
     /// The vision tower, loaded by the first image (about 300 MB of packed weights).
     vision: OnceLock<Vision>,
     vision_loading: Mutex<()>,
+    audio_cfg: Option<AudioConfig>,
+    /// The audio tower, loaded by the first clip (about 580 MB of packed weights).
+    audio: OnceLock<Audio>,
+    audio_loading: Mutex<()>,
 }
 
 /// Concurrent forward passes in a batch: `$EG2_MAX_IN_FLIGHT`, else the pool's thread count.
@@ -211,6 +216,7 @@ impl Model {
         let json: Value = serde_json::from_slice(&std::fs::read(dir.join("config.json"))?)?;
         let cfg = Config::from_json(&json)?;
         let vision_cfg = VisionConfig::from_json(&json)?;
+        let audio_cfg = AudioConfig::from_json(&json)?;
         // The tokenizer first: parsing its 31 MB JSON briefly takes ~315 MB, which would otherwise stack on top of
         // the weights and set the process's peak.
         let mut tokenizer = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| anyhow!("tokenizer: {e}"))?;
@@ -283,6 +289,9 @@ impl Model {
             vision_cfg,
             vision: OnceLock::new(),
             vision_loading: Mutex::new(()),
+            audio_cfg,
+            audio: OnceLock::new(),
+            audio_loading: Mutex::new(()),
         })
     }
 
@@ -298,6 +307,20 @@ impl Model {
         let cfg = self.vision_cfg.as_ref().context("this checkpoint has no vision tower")?;
         let v = Vision::load(cfg, self.cfg.hidden, &Tensors::parse(&self.mmap)?)?;
         Ok(self.vision.get_or_init(|| v))
+    }
+
+    /// The audio tower, loading it on first use.
+    fn audio(&self) -> Result<&Audio> {
+        if let Some(a) = self.audio.get() {
+            return Ok(a);
+        }
+        let _guard = self.audio_loading.lock().unwrap();
+        if let Some(a) = self.audio.get() {
+            return Ok(a);
+        }
+        let cfg = self.audio_cfg.as_ref().context("this checkpoint has no audio tower")?;
+        let a = Audio::load(cfg, self.cfg.hidden, &Tensors::parse(&self.mmap)?)?;
+        Ok(self.audio.get_or_init(|| a))
     }
 }
 
@@ -349,13 +372,48 @@ impl Model {
     /// The text tower over `<bos> <boi> soft tokens <eoi> <eos>`: the image's embedding and layer means. Runs on a
     /// pool sized to the sequence length, directly (not through the request scheduler).
     pub fn embed_soft_tokens(&self, soft: &[f32]) -> Output {
+        let vc = self.vision_cfg.as_ref().expect("image soft tokens come from the vision tower");
+        self.embed_between(soft, vc.boi_token, vc.image_token, vc.eoi_token)
+    }
+
+    /// Embed a WAV file (PCM or float, 16 kHz, any number of channels, which are averaged). At most the first 30 s
+    /// are used, as the processor does.
+    pub fn embed_audio(&self, wav: &[u8]) -> Result<Output> {
+        self.embed_audio_samples(&crate::audio::decode_wav(wav)?)
+    }
+
+    /// Embed 16 kHz mono samples in [-1, 1].
+    pub fn embed_audio_samples(&self, samples: &[f32]) -> Result<Output> {
+        let soft = self.audio_soft_tokens(&crate::audio::log_mel(samples))?;
+        Ok(self.embed_audio_soft_tokens(&soft))
+    }
+
+    /// The audio tower's soft tokens for log-mel features (`audio::log_mel`, [frames, 128]): [ceil(frames / 4),
+    /// hidden], what the text tower receives in place of the audio placeholder tokens. Runs on the vision pool.
+    pub fn audio_soft_tokens(&self, mel: &[f32]) -> Result<Vec<f32>> {
+        ensure!(!mel.is_empty(), "audio too short: a clip needs at least 161 samples (10 ms)");
+        let audio = self.audio()?;
+        Ok(match vision_pool() {
+            Some(pool) => pool.install(|| audio.forward(mel)),
+            None => audio.forward(mel),
+        })
+    }
+
+    /// The text tower over `<bos> <boa> soft tokens <eoa> <eos>`: the clip's embedding and layer means.
+    pub fn embed_audio_soft_tokens(&self, soft: &[f32]) -> Output {
+        let ac = self.audio_cfg.as_ref().expect("audio soft tokens come from the audio tower");
+        self.embed_between(soft, ac.boa_token, ac.audio_token, ac.eoa_token)
+    }
+
+    /// The text tower over `<bos> <begin> soft tokens <end> <eos>`, the soft tokens in place of `placeholder` ids.
+    /// Runs on a pool sized to the sequence length, directly (not through the request scheduler).
+    fn embed_between(&self, soft: &[f32], begin: u32, placeholder: u32, end: u32) -> Output {
         let (cfg, d) = (&self.cfg, self.cfg.hidden);
-        let vc = self.vision_cfg.as_ref().expect("soft tokens come from the vision tower");
         assert!(!soft.is_empty() && soft.len().is_multiple_of(d), "soft tokens must be [n, {d}]");
         let n = soft.len() / d;
-        let mut ids = vec![cfg.bos_token, vc.boi_token];
-        ids.extend(std::iter::repeat_n(vc.image_token, n));
-        ids.extend([vc.eoi_token, cfg.eos_token]);
+        let mut ids = vec![cfg.bos_token, begin];
+        ids.extend(std::iter::repeat_n(placeholder, n));
+        ids.extend([end, cfg.eos_token]);
         let mut h = self.embed_ids(&ids);
         h[2 * d..(2 + n) * d].copy_from_slice(soft);
         let run = || {

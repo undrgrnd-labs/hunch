@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "eg2cpu"
 version = "0.1.0"
-description = "CPU (SIMD, SME, AMX) inference for the EmbeddingGemma 2 encoder, text and images, with compiled decision handles"
+description = "CPU (SIMD, SME, AMX) inference for the EmbeddingGemma 2 encoder, text, images and audio, with compiled decision handles"
 readme = "README.md"
 license = "MIT OR Apache-2.0"
 license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
