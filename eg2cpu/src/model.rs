@@ -17,8 +17,8 @@ use std::sync::{Mutex, OnceLock};
 use crate::audio::{Audio, AudioConfig};
 use crate::sched::Scheduler;
 use crate::tensors::Tensors;
+use crate::tokenizer::Tokenizer;
 use crate::vision::{DEFAULT_SOFT_TOKENS, Rgb, Vision, VisionConfig};
-use tokenizers::{Tokenizer, TruncationParams};
 
 pub const MAX_TOKENS: usize = 1024;
 
@@ -220,13 +220,9 @@ impl Model {
         let cfg = Config::from_json(&json)?;
         let vision_cfg = VisionConfig::from_json(&json)?;
         let audio_cfg = AudioConfig::from_json(&json)?;
-        // The tokenizer first: parsing its 31 MB JSON briefly takes ~315 MB, which would otherwise stack on top of
-        // the weights and set the process's peak.
-        let mut tokenizer = Tokenizer::from_file(dir.join("tokenizer.json")).map_err(|e| anyhow!("tokenizer: {e}"))?;
-        tokenizer
-            .with_truncation(Some(TruncationParams { max_length: MAX_TOKENS, ..Default::default() }))
-            .map_err(|e| anyhow!("tokenizer: {e}"))?;
-        tokenizer.with_padding(None);
+        // The tokenizer first: reading its 31 MB JSON briefly takes ~110 MB, which would otherwise stack on top of the
+        // weights.
+        let tokenizer = Tokenizer::load(&dir.join("tokenizer.json"), MAX_TOKENS)?;
         let file = File::open(dir.join("model.safetensors"))?;
         // SAFETY: the checkpoint is read-only and not modified while mapped.
         let mmap = unsafe { Mmap::map(&file)? };
@@ -437,8 +433,7 @@ impl Model {
 
     /// Token ids with `<bos>`/`<eos>`, truncated to `MAX_TOKENS` (as `tok(text, truncation=True, max_length=1024)`).
     pub fn tokenize(&self, text: &str) -> Result<Vec<u32>> {
-        let enc = self.tokenizer.encode(text, true).map_err(|e| anyhow!("tokenize: {e}"))?;
-        Ok(enc.get_ids().to_vec())
+        Ok(self.tokenizer.encode(text))
     }
 
     pub fn embed(&self, text: &str) -> Result<Output> {

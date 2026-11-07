@@ -13,12 +13,14 @@ mod simd;
 #[cfg(target_arch = "aarch64")]
 mod sme;
 mod tensors;
+mod tokenizer;
 mod vision;
 
 pub use audio::{AudioConfig, MAX_SAMPLES, SAMPLE_RATE, decode_wav, frames_for, log_mel, soft_tokens_for};
 pub use decision::{CmpOp, FORMAT, Gate, Handle, Kind, Operand, Readout, Span, Status, Template, Verdict};
 pub use model::{Config, LayerSpec, MAX_TOKENS, Model, Output, Partial, default_model_dir, max_in_flight, take_trace};
 pub use simd::{Bf16, Isa, bf16_mode, isa};
+pub use tokenizer::Tokenizer;
 pub use vision::{
     DEFAULT_SOFT_TOKENS, Rgb, SOFT_TOKEN_BUDGETS, VisionConfig, decode as decode_image, resize as resize_image,
 };

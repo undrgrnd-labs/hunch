@@ -170,12 +170,12 @@ and that a bad request panics only its own caller.
 
 ## Memory
 
-Once loaded, the text encoder's bf16 weights take 261 MB and the tokenizer about 136 MB. The 256 MB embedding table
-stays memory-mapped, so only the rows of tokens actually seen are read. The vision tower adds about 300 MB of packed
-weights, loaded on the first image; its 31 MB position table stays memory-mapped. Activations add about 30 MB per
-image at 70 soft tokens and 130 MB at 280. Peak footprint is 419 MB for text only, 762 MB after one image at 70 soft
-tokens, and 850 MB at 280. The audio tower adds about 580 MB of packed weights, loaded on the first clip; peak footprint
-is about 990 MB after a short clip and 1.18 GB after a 30 s one. A forward pass in flight costs about 30 MB
+Once loaded, the text encoder's bf16 weights take 261 MB and the tokenizer's merge table 17 MB. The 256 MB embedding
+table stays memory-mapped, so only the rows of tokens actually seen are read. The vision tower adds about 300 MB of
+packed weights, loaded on the first image; its 31 MB position table stays memory-mapped. Activations add about 30 MB
+per image at 70 soft tokens and 130 MB at 280. Peak footprint is about 320 MB for text only, 630 MB after one image at
+70 soft tokens, and 740 MB at 280. The audio tower adds about 580 MB of packed weights, loaded on the first clip; peak
+footprint is about 930 MB after a short clip and 1.12 GB after a 30 s one. A forward pass in flight costs about 30 MB
 at 512 tokens; `EG2_MAX_IN_FLIGHT` bounds how many are in flight. Measured footprints are in
 [../docs/performance.md](../docs/performance.md).
 
@@ -344,6 +344,13 @@ features, the soft tokens, the layer means and the embedding. The cases are thre
 (validation-clean, CC BY 4.0) as 16-bit WAV, a stereo float WAV, a 0.3 s 24-bit tone, and an utterance repeated past
 the 30 s cap. Features agree to 5e-7, soft tokens and layer means to about 1e-6 relative, and embeddings have cosine
 ≥ 0.9999996, including on the NEON (`EG2_SME=off`) and scalar paths.
+
+The tokenizer (`src/tokenizer.rs`) reads the checkpoint's `tokenizer.json` and implements only what Gemma's uses:
+special tokens matched in the raw text, spaces as `▁`, and BPE with byte fallback. It refuses a file that asks for
+anything else. `tests/tokenizer_parity.rs` checks its ids against the Hugging Face `tokenizers` crate, a
+dev-dependency, on this crate's source and docs, every string in the fixtures, inputs past the 1,024-token cut, and
+5,000 random mixes of scripts, emoji, whitespace, control characters, rare code points and broken special tokens. The
+ids are identical; it loads in about 130 ms against 280 ms and encodes about 2.5× faster.
 
 Without a checkpoint these tests are skipped, unless `EG2_REQUIRE_MODEL` is set; then they fail. CI
 (`.github/workflows/ci.yml`) sets it and runs `cargo test --release` on Linux x86-64 and macOS arm64 against the

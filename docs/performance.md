@@ -98,20 +98,19 @@ batch, the single requests take p50 155 ms and p95 471 ms, and the batch finishe
 
 | | footprint |
 |---|---|
-| loaded, idle | 400–550 MB |
-| peak while loading | 405–553 MB |
-| one 1,024-token text | 468 MB peak |
-| 256 texts × 128 tokens (`forward_batch`) | 549 MB |
-| 256 texts × 512 tokens | 962 MB |
-| `apply`, 256 spans × ~128 tokens | 596 MB |
-| 32 callers × 128 tokens | 542 MB |
+| loaded, idle | 315 MB |
+| one short text, load included | 317 MB peak |
+| one 1,024-token text | 371 MB peak |
+| 256 texts × 128 tokens (`forward_batch`) | 466 MB |
+| 256 texts × 512 tokens | 870 MB |
+| `apply`, 256 spans × ~120 tokens | 470 MB |
+| 32 callers × 128 tokens | 452 MB |
 
-The idle figure is bimodal from run to run, depending on when macOS takes back the tokenizer's freed parse memory.
 `EG2_MAX_IN_FLIGHT` trades speed for memory:
 
 | `EG2_MAX_IN_FLIGHT` (256 × 512 tokens) | 4 | 8 | 12 | 18 (default here) |
 |---|---|---|---|---|
-| peak footprint | 588 MB | 708 MB | 821 MB | 964 MB |
+| peak footprint | 578 MB | 639 MB | 720 MB | 863 MB |
 | time | 41.3 s | 40.6 s | 40.1 s | 36.9 s |
 
 ## Intel Sapphire Rapids with AMX (AWS c7i.12xlarge, 24 cores)
