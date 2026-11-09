@@ -182,19 +182,20 @@ def _probability(x: Any) -> float:
 
 def parse_answer(q: dict, answer: Any) -> tuple[int, list[float] | None]:
     """(class index, probabilities or None) from an answer object, a probability list, or a plain label. For a noul,
-    a bare float is P(yes) (a bool, or the integer 0 or 1, is a label). Probabilities must be finite and in [0, 1],
-    one per option; anything else raises ValueError."""
+    a bare float is P(yes) (a bool, or the integer 0 or 1, is a label), and an answer object's "noul" is read
+    before its "probabilities". Probabilities must be finite and in [0, 1], one per option; anything else raises
+    ValueError."""
     opts = options(q)
     if isinstance(answer, dict):
+        if "noul" in answer and q["type"] == "noul":  # taken over any "probabilities", whose keys vary by teacher
+            p1 = _probability(answer["noul"])
+            return int(p1 >= 0.5), [1 - p1, p1]
         if "probabilities" in answer:
             probs = answer["probabilities"]
             if not isinstance(probs, dict) or set(probs) != set(opts):
                 raise ValueError(f"probabilities must name exactly the options {opts}, got {probs!r}")
             p = [_probability(probs[o]) for o in opts]
             return int(np.argmax(p)), p
-        if "noul" in answer and q["type"] == "noul":
-            p1 = _probability(answer["noul"])
-            return int(p1 >= 0.5), [1 - p1, p1]
         raise ValueError(f"unrecognized answer object: {answer}")
     if isinstance(answer, (list, tuple)):
         p = [_probability(x) for x in answer]

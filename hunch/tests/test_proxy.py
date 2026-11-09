@@ -103,6 +103,12 @@ def test_parse_answer_forms():
     assert parse_answer(FAILED, "no") == (0, None)
     assert parse_answer(FAILED, [0.8]) == (1, [0.19999999999999996, 0.8])
     assert parse_answer(FAILED, {"type": "noul", "noul": 0.1})[0] == 0
+    # "noul" wins over probabilities named otherwise (yes/no), or that disagree with it
+    assert parse_answer(FAILED, {"type": "noul", "noul": 0.75, "probabilities": {"yes": 0.75, "no": 0.25}}) == (1, [0.25, 0.75])
+    assert parse_answer(FAILED, {"noul": 0.2, "probabilities": {"false": 0.1, "true": 0.9}}) == (0, [0.8, 0.2])
+    assert parse_answer(FAILED, {"probabilities": {"false": 0.1, "true": 0.9}}) == (1, [0.1, 0.9])
+    with pytest.raises(ValueError):
+        parse_answer(FAILED, {"probabilities": {"yes": 0.9, "no": 0.1}})  # without "noul", the options must match
     assert parse_answer(KIND, "vcs") == (1, None)
     assert parse_answer(KIND, {"probabilities": {"test": 0.3, "vcs": 0.7}}) == (1, [0.3, 0.7])
     with pytest.raises(ValueError):
@@ -813,6 +819,17 @@ def test_a_malformed_teacher_answer_is_not_learned(db):
     proxy.backend = lambda req: {"answers": dict(teacher(req)["answers"], extra={"noul": 0.5})}
     r = proxy.answer({"state": unit(random.Random(14), 1), "questions": {"f": FAILED}})
     assert r["answered_by"] == "backend" and list(r["answers"]) == ["f"]
+
+
+def test_a_noul_answer_with_yes_no_probabilities_is_learned(db):
+    def teacher(req):  # as clef-flash on vLLM answers some requests
+        return {"model": "clef-flash", "answers": {"f": {"type": "noul", "noul": 0.9,
+                                                         "probabilities": {"yes": 0.9, "no": 0.1}}}}
+
+    proxy = Proxy(FakeModel(), teacher, db(), audit=0.0)
+    r = proxy.answer({"state": unit(random.Random(15), 1), "questions": {"f": FAILED}})
+    assert r["answered_by"] == "backend" and r["answers"]["f"]["noul"] == 0.9
+    assert proxy.question_status(question_key(FAILED))["examples"] == {"sampled": 1}
 
 
 def test_refits_of_one_version_run_one_at_a_time(db, monkeypatch):
