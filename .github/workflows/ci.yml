@@ -31,17 +31,25 @@ jobs:
       - run: cargo fmt --check
 
   eg2cpu:
-    name: eg2cpu (${{ matrix.os }}, EG2_BF16=${{ matrix.bf16 }})
+    name: eg2cpu (${{ matrix.os }}, EG2_BF16=${{ matrix.bf16 }}${{ matrix.weights && matrix.weights != 'bf16' && format(', EG2_WEIGHTS={0}', matrix.weights) || '' }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, ubuntu-24.04-arm]
         bf16: [default]
-        # Arm Linux runs bf16 BFMMLA matmuls by default; check the fp32 path there too (a value of its own, so this is
-        # a job of its own rather than merged into the default one)
+        weights: [bf16]
+        # Each entry below has a value of its own, so it is a job of its own rather than merged into a default one.
         include:
+          # Arm Linux runs bf16 BFMMLA matmuls by default; check the fp32 path there too
           - os: ubuntu-24.04-arm
             bf16: "off"
+          # 8-bit weights: int8 through the x86 fp32 kernels, fp8 through BFMMLA, both decoding panels to bf16
+          - os: ubuntu-latest
+            bf16: default
+            weights: int8
+          - os: ubuntu-24.04-arm
+            bf16: default
+            weights: fp8
     runs-on: ${{ matrix.os }}
     defaults:
       run:
@@ -82,3 +90,4 @@ jobs:
         env:
           EG2_REQUIRE_MODEL: "1"
           EG2_BF16: ${{ matrix.bf16 != 'default' && matrix.bf16 || '' }}
+          EG2_WEIGHTS: ${{ matrix.weights != 'bf16' && matrix.weights || '' }}

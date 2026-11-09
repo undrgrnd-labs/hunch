@@ -71,14 +71,17 @@ fn matches_pytorch_image_reference() {
             sum as i64 - want_sum as i64
         );
         // Lossless images match to fp32 rounding. bf16 matmuls (EG2_BF16) round the activations through both towers (a
-        // synthetic gradient can fall to cosine 0.9998), so they get a looser bar. JPEG decoders differ by a few pixel
+        // synthetic gradient can fall to cosine 0.9998), so they get a looser bar, and 8-bit weights (EG2_WEIGHTS)
+        // looser ones still: int8 gives a cosine of about 0.9997 or better, fp8 0.9986. JPEG decoders differ by a few pixel
         // levels, and by how many depends on the platform (jpeg-decoder's x86-64 and Arm paths differ from each other as
         // well as from libjpeg-turbo), so the drift bar is looser still there; the cosine bar is the same.
         let exact = lossless && eg2cpu::bf16_mode() == eg2cpu::Bf16::Off;
-        let (min_cos, max_drift) = match (exact, lossless) {
-            (true, _) => (0.99999, 1e-3),
-            (false, true) => (0.9995, 2e-2),
-            (false, false) => (0.9995, 5e-2),
+        let (min_cos, max_drift) = match (eg2cpu::weights_mode(), exact, lossless) {
+            (eg2cpu::Weights::Int8, _, _) => (0.999, 6e-2),
+            (eg2cpu::Weights::Fp8, _, _) => (0.997, 1.2e-1),
+            (_, true, _) => (0.99999, 1e-3),
+            (_, false, true) => (0.9995, 2e-2),
+            (_, false, false) => (0.9995, 5e-2),
         };
         assert!(cos > min_cos, "{file}: embedding cosine {cos}");
         assert!(soft_err < max_drift && worst_layer < max_drift, "{file}: drift {soft_err} {worst_layer}");

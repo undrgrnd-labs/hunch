@@ -750,11 +750,15 @@ class OfflineBackend:
 
 
 def encoder_fingerprint(model, layer: int) -> dict:
-    """What the stored features depend on: the checkpoint revision, the layer read, the matmul precision and the
-    clipping of long states."""
+    """What the stored features depend on: the checkpoint revision, the layer read, the matmul precision (with
+    eg2cpu's 8-bit weights, if on) and the clipping of long states."""
     bf16 = os.environ.get("EG2_BF16", "off").strip().lower()
-    return {"revision": getattr(model, "revision", type(model).__name__), "layer": layer,
-            "precision": "fp32" if bf16 in ("", "off", "0", "none") else f"bf16:{bf16}", "clip": CLIP_CHARS}
+    precision = "fp32" if bf16 in ("", "off", "0", "none") else f"bf16:{bf16}"
+    weights = os.environ.get("EG2_WEIGHTS", "")
+    if weights in ("int8", "fp8"):  # the values eg2cpu acts on
+        precision += f"+{weights}"
+    return {"revision": getattr(model, "revision", type(model).__name__), "layer": layer, "precision": precision,
+            "clip": CLIP_CHARS}
 
 
 class Encoder:

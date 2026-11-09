@@ -39,11 +39,17 @@ fn matches_pytorch_reference() {
         worst = worst.max(worst_layer);
         lowest = lowest.min(cos);
     }
-    // fp32 matches PyTorch to rounding; bf16 matmuls (EG2_BF16=amx|dot|bfmmla) round the activations too, so they get
-    // their own, looser bar.
-    let (min_cos, max_drift) = if eg2cpu::bf16_mode() == eg2cpu::Bf16::Off { (0.99999, 1e-3) } else { (0.9999, 2e-2) };
+    // fp32 matches PyTorch to rounding; bf16 matmuls (EG2_BF16=amx|dot|bfmmla) round the activations too, and 8-bit
+    // weights (EG2_WEIGHTS=int8|fp8) round the weights, so each gets its own, looser bar.
+    let (min_cos, max_drift) = match (eg2cpu::weights_mode(), eg2cpu::bf16_mode()) {
+        (eg2cpu::Weights::Int8, _) => (0.999, 6e-2),
+        (eg2cpu::Weights::Fp8, _) => (0.997, 1.2e-1),
+        (_, eg2cpu::Bf16::Off) => (0.99999, 1e-3),
+        _ => (0.9999, 2e-2),
+    };
     println!(
-        "{:?}: lowest cos {lowest:.7} (bar {min_cos}), worst layer drift {worst:.2e} (bar {max_drift:.0e})",
+        "{:?} {:?}: lowest cos {lowest:.7} (bar {min_cos}), worst layer drift {worst:.2e} (bar {max_drift:.0e})",
+        eg2cpu::weights_mode(),
         eg2cpu::bf16_mode()
     );
     assert!(lowest > min_cos, "embedding cosine {lowest}");

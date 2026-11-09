@@ -52,6 +52,20 @@ count (`hw.perflevel0.physicalcpu`, 6 here) with floors of 8 and 12 threads: `40
 Texts of 48 and 64 tokens run 2–6% faster on 12 threads than on 8 threads. 8 threads suit texts of up to 40 tokens,
 even with only 6 P-cores. With 4 threads, a 32-token text takes twice as long as a 16-token text.
 
+**8-bit weights** (`EG2_WEIGHTS`), each run once on a busy machine, so within a few percent. The SME kernel widens
+int8 codes as it loads them, as cheaply as bf16; e4m3 takes four more instructions per step. The NEON and `BFMMLA`
+kernels get bf16 panels that each task decodes:
+
+| | bf16 | int8 | fp8 |
+|---|---|---|---|
+| SME, 1 text × 16 tokens | 7.4 ms | 7.7 ms | 10.7 ms |
+| SME, 1 text × 128 tokens | 31 ms | 33 ms | 42 ms |
+| SME, 256 texts × 32 tokens | 8,760 tokens/s | 10,240 tokens/s | 7,850 tokens/s |
+| SME, one image at 70 soft tokens | 98 ms | 101 ms | 125 ms |
+| NEON (`EG2_SME=off`), 1 text × 16 tokens | 17 ms | 19 ms | 22 ms |
+| NEON, 1 text × 128 tokens | 70 ms | 75 ms | 80 ms |
+| `BFMMLA` (`EG2_SME=off EG2_BF16=bfmmla`), 1 text × 128 tokens | 104 ms | 104 ms | 105 ms |
+
 **`EG2_BF16=bfmmla`** (Arm `BFMMLA`) applies only with `EG2_SME=off` here, since SME takes the matmuls when present.
 The M5 Pro reports `bf16`, but a P-core issues 2.1 G `BFMMLA`/s (68 GFLOP/s), half its fp32 `FMLA` rate, so the bf16
 path is slower than NEON fp32. The kernel runs at that instruction rate:
