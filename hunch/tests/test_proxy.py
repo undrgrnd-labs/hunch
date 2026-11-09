@@ -36,6 +36,9 @@ class FakeModel:
 
         self.batches.append(len(texts))
         time.sleep(self.delay)
+        return self._partials(texts, upto)
+
+    def _partials(self, texts, upto):
         shift = upto - 8 + (0 if self.revision == "fake" else zlib.crc32(self.revision.encode()) % D)
         out = []
         for t in texts:
@@ -44,6 +47,18 @@ class FakeModel:
                 v[zlib.crc32(w.encode()) % D] += 1
             out.append(FakePartial(upto, np.roll(v / (np.linalg.norm(v) + 1e-9), shift)))
         return out
+
+    def embed_batch(self, texts):
+        """(embedding, layer means): the layer-8 vector of the text's words in reverse, so it differs from the
+        features."""
+        import time
+
+        self.batches.append(len(texts))
+        time.sleep(self.delay)
+        return [(p.layer_means[8], None) for p in self._partials([" ".join(t.split()[::-1]) + " ." for t in texts], 8)]
+
+    def tokenize(self, text):
+        return [2, *range(len(text.split())), 1]
 
 
 @pytest.fixture(params=["sqlite", "redis"])
@@ -191,6 +206,63 @@ def test_http_endpoints(db):
     with urllib.request.urlopen(base + "/healthz") as r:
         assert r.status == 200 and json.load(r) == {"ok": True}
     server.shutdown()
+
+
+def test_http_embeddings_as_vllm_serves_them(db):
+    import base64
+
+    from hunch.proxy import EMBEDDING_MODEL
+
+    model = FakeModel()
+    proxy = Proxy(model, None, db())
+    server = serve(proxy, port=0, token="s3cret")
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    def post(body, token="s3cret"):
+        req = urllib.request.Request(f"http://127.0.0.1:{server.server_address[1]}/v1/embeddings",
+                                     json.dumps(body).encode(), {"Authorization": f"Bearer {token}"})
+        try:
+            with urllib.request.urlopen(req) as r:
+                return r.status, json.load(r)
+        except urllib.error.HTTPError as e:
+            return e.code, json.load(e)
+
+    texts = ["error: not found", "ok all good done", "13 passed done"]
+    want = np.stack([e for e, _ in FakeModel().embed_batch(texts)])
+    code, r = post({"model": EMBEDDING_MODEL, "input": texts})
+    assert code == 200 and r["object"] == "list" and r["model"] == EMBEDDING_MODEL and r["id"].startswith("embd-")
+    assert [(d["index"], d["object"]) for d in r["data"]] == [(0, "embedding"), (1, "embedding"), (2, "embedding")]
+    got = np.array([d["embedding"] for d in r["data"]], dtype=np.float32)
+    assert np.array_equal(got, want) and not np.allclose(got, proxy.features(texts)[1])  # not the students' features
+    assert r["usage"] == {"prompt_tokens": 5 + 6 + 5, "total_tokens": 16, "completion_tokens": 0}
+
+    code, r = post({"input": texts[0], "encoding_format": "base64", "dimensions": D})  # model may be left out
+    assert code == 200 and len(r["data"]) == 1
+    assert np.array_equal(np.frombuffer(base64.b64decode(r["data"][0]["embedding"]), "<f4"), want[0])
+    assert proxy.status()["stats"]["embedded"] == 4
+
+    code, r = post({"model": "text-embedding-3-small", "input": "x"})
+    assert code == 404 and r["error"] == {"message": "The model `text-embedding-3-small` does not exist.",
+                                          "type": "NotFoundError", "param": None, "code": 404}
+    for bad in ({"input": []}, {"input": [[2, 15, 1]]}, {"input": 3}, {}, {"input": "x", "dimensions": D // 2},
+                {"input": "x", "encoding_format": "bytes"}):
+        code, r = post(bad)
+        assert code == 400 and r["error"]["type"] == "BadRequestError" and r["error"]["message"], bad
+    code, r = post({"input": "x"}, token="wrong")
+    assert code == 401 and r["error"]["code"] == 401
+    server.shutdown()
+
+
+def test_embeddings_share_the_encoder_thread_with_features(db):
+    model = FakeModel(delay=0.05)
+    proxy = Proxy(model, None, db())
+    threads = [threading.Thread(target=proxy.features, args=([f"state {i}"],)) for i in range(4)]
+    threads += [threading.Thread(target=proxy.embeddings, args=({"input": f"text {i}"},)) for i in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert sum(model.batches) == 8 and len(model.batches) < 8  # waiting texts of both kinds are batched
 
 
 def test_answer_cache_and_offline_backend(tmp_path):
