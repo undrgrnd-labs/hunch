@@ -6,6 +6,8 @@ Kernels are picked at runtime: AVX-512, AVX2+FMA, NEON, or a scalar fallback. On
 the SME matrix unit, still in fp32. On Intel CPUs with AMX, `EG2_BF16=amx` runs the matmuls and attention in bf16 on AMX
 tiles instead. On Arm Linux CPUs with BF16 and no SME (Neoverse V2 and N2, the DGX Spark's Cortex-X925), the matmuls
 and attention run in bf16 with `BFMMLA` by default, 3-4x faster than fp32 on Neoverse N2; `EG2_BF16=off` keeps fp32.
+`EG2_WEIGHTS=int8` or `fp8` keeps the matrices as 8-bit codes with one scale per output column, which takes peak memory
+from about 330 MB to 200 MB for text and from about 1 GB to 600 MB with all three towers loaded.
 
 The text tower is loaded up front. The vision tower is loaded by the first image, and the audio tower by the first
 audio clip. A forward pass returns:
@@ -179,6 +181,27 @@ footprint is about 930 MB after a short clip and 1.12 GB after a 30 s one. A for
 at 512 tokens; `EG2_MAX_IN_FLIGHT` bounds how many are in flight. Measured footprints are in
 [../docs/performance.md](../docs/performance.md).
 
+**8-bit weights.** `EG2_WEIGHTS=int8` or `fp8` quantizes every packed matrix as it loads, to the codes and scales the
+browser engine's `examples/browser/convert.py` writes:
+- `int8`: one scale per output column, the column's largest magnitude over 127; codes are rounded to the nearest
+  integer, ties to even.
+- `fp8`: e4m3 codes, with the largest magnitude over 448 as the scale; codes are the nearest finite e4m3 value.
+
+Each packed matrix takes half its bf16 size. Peak footprint, from `eg2 embed`, `image-embed` and `audio-embed` on an
+M5 Pro:
+
+| | bf16 | int8 | fp8 |
+|---|---|---|---|
+| text only | 332 MB | 196 MB | 196 MB |
+| after one image (280 soft tokens) | 770 MB | 499 MB | 500 MB |
+| after one 12 s clip | 1,037 MB | 593 MB | 595 MB |
+
+The SME kernel widens the codes as it loads them, and int8 runs at bf16's speed there; fp8 takes 15-45% longer,
+since e4m3 takes more instructions to widen. The other kernels see bf16: each matmul task decodes its panels into a
+per-thread buffer, about 256 KB at a time, and scales its output columns. That costs 5-25% on NEON fp32 and up to 10%
+with `BFMMLA` on an M5 Pro (see [performance](../docs/performance.md)). Loading takes 10-20% longer for int8 and about
+35% longer for fp8.
+
 ## Decisions: compiled contrastive readouts
 
 > Writing a new question, for a handle or for a proxy that learns from a teacher? Read
@@ -315,6 +338,7 @@ method, the requested method and the reason.
 | `EG2_BF16` | `bfmmla` on Arm Linux with BF16 and no SME; else `off` | `amx`: bf16 matmuls on AMX tiles. `dot`: AVX-512 BF16 dot products (slower than fp32 on current CPUs). `bfmmla`: bf16 matmuls with Arm `BFMMLA`, where SME is not in use (slower than fp32 NEON on Apple silicon, see [performance](../docs/performance.md)). `off`: fp32 |
 | `EG2_BF16_ATTN` | `all` | with `EG2_BF16=amx` or `bfmmla`: which attention products run in bf16 (`all`, `pv` or `off`) |
 | `EG2_SME` | on where available | `off`: NEON matmuls on CPUs with SME (Apple M4 and later) |
+| `EG2_WEIGHTS` | `bf16` | `int8` or `fp8`: keep the matrices as 8-bit codes with a scale per output column, half the memory (see [Memory](#memory)) |
 | `EG2_POOLS` | with SME `128:4,320:8,640:10`; else from the core count | thread pools for single texts by length (tokens:threads); longer texts use the whole pool. Without SME, texts up to 40 tokens get half the performance cores and up to 160 all of them, at least 8 and 12 threads: `40:8,160:12` on an M5 Pro with `EG2_SME=off`, `40:8,160:16` (so 160 tokens use the whole pool) on 16 Neoverse V2 cores |
 | `EG2_VISION_THREADS` | with SME, performance cores + 2; else all | threads for the vision and audio towers |
 | `EG2_MAX_IN_FLIGHT` | thread count | forward passes in flight at once, process-wide; lower it to trade speed for memory |
@@ -344,6 +368,10 @@ features, the soft tokens, the layer means and the embedding. The cases are thre
 (validation-clean, CC BY 4.0) as 16-bit WAV, a stereo float WAV, a 0.3 s 24-bit tone, and an utterance repeated past
 the 30 s cap. Features agree to 5e-7, soft tokens and layer means to about 1e-6 relative, and embeddings have cosine
 ≥ 0.9999996, including on the NEON (`EG2_SME=off`) and scalar paths.
+
+With `EG2_WEIGHTS=int8` the three reference tests find a cosine of 0.9996 or better against PyTorch's bf16-weight
+outputs (text 0.99975, images 0.99956, audio 0.99962 at the lowest), and with `fp8` 0.9986 or better. Their bars are
+0.999 and 0.997. The unit tests check that every 8-bit kernel path matches the product with the dequantized weights.
 
 The tokenizer (`src/tokenizer.rs`) reads the checkpoint's `tokenizer.json` and implements only what Gemma's uses:
 special tokens matched in the raw text, spaces as `▁`, and BPE with byte fallback. It refuses a file that asks for

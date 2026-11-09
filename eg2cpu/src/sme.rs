@@ -13,7 +13,7 @@
 //! Used when the CPU has SME with a 512-bit streaming vector length (Apple M4 and later); `EG2_SME=off` disables it.
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use crate::simd::{Packed, SendPtr, Split, softmax_cols, task_target};
+use crate::simd::{Packed, SendPtr, Split, Weights, softmax_cols, task_target};
 use rayon::prelude::*;
 use std::arch::asm;
 use std::cell::RefCell;
@@ -58,11 +58,21 @@ unsafe fn svl_bytes() -> u64 {
     v
 }
 
+/// The type of B's values.
+#[derive(Clone, Copy)]
+enum B {
+    F32 = 0,
+    Bf16 = 1,
+    /// int8 codes, widened to their values.
+    Int8 = 2,
+    /// e4m3 codes, widened to their values times 2^-8: a code shifted into half-precision bit positions.
+    E4m3 = 3,
+}
+
 /// How B is laid out and C written.
 #[derive(Clone, Copy)]
 struct Mode {
-    /// B values are bf16 (else fp32).
-    bf16: bool,
+    b: B,
     /// Store C^T: column `cc` of the block goes to `C + cc * ldc` as a contiguous run of `rows` values.
     transposed: bool,
 }
@@ -72,7 +82,7 @@ struct Mode {
 /// columns) of B starts at `b + j * bjump` bytes. C is fp32 with a leading dimension of `ldc` elements.
 ///
 /// Predicates: p0 all lanes, p1/p2 rows 0..15/16..31, p3/p4 the block's columns 0..15/16..31, p5 the block's 32
-/// columns as halfwords (for bf16 B).
+/// columns as halfwords (for bf16 B). 8-bit B is sign-extended into 32-bit lanes as it loads, two loads of 16 codes.
 ///
 /// # Safety
 /// Every addressed A, B and C element of the valid rows and columns must be in bounds; the CPU must have SME
@@ -103,7 +113,12 @@ unsafe fn strip(
         "mov {pa}, {a}",
         "mov {pb}, {b}",
         "mov {kk}, {k}",
-        "cbz {bf16}, 23f",
+        "cmp {bk}, #1",
+        "b.lo 23f",
+        "b.eq 21f",
+        "cmp {bk}, #2",
+        "b.eq 26f",
+        "b 27f",
         // k loop, bf16 B: widen by interleaving zero low halves
         "21:",
         "ld1w {{z0.s}}, p1/z, [{pa}]",
@@ -137,6 +152,47 @@ unsafe fn strip(
         "add {pb}, {pb}, {bstr}",
         "subs {kk}, {kk}, #1",
         "b.ne 23b",
+        "b 25f",
+        // k loop, int8 B
+        "26:",
+        "ld1w {{z0.s}}, p1/z, [{pa}]",
+        "add {t}, {pa}, #64",
+        "ld1w {{z1.s}}, p2/z, [{t}]",
+        "ld1sb {{z2.s}}, p3/z, [{pb}]",
+        "ld1sb {{z3.s}}, p4/z, [{pb}, #1, mul vl]",
+        "scvtf z2.s, p0/m, z2.s",
+        "scvtf z3.s, p0/m, z3.s",
+        "fmopa za0.s, p0/m, p0/m, z0.s, z2.s",
+        "fmopa za1.s, p0/m, p0/m, z0.s, z3.s",
+        "fmopa za2.s, p0/m, p0/m, z1.s, z2.s",
+        "fmopa za3.s, p0/m, p0/m, z1.s, z3.s",
+        "add {pa}, {pa}, {astr}",
+        "add {pb}, {pb}, {bstr}",
+        "subs {kk}, {kk}, #1",
+        "b.ne 26b",
+        "b 25f",
+        // k loop, e4m3 B: shifted left 7, the sign-extended code is sign | exponent | mantissa in half-precision
+        // positions once bit 14 (a copy of the sign) is cleared
+        "27:",
+        "ld1w {{z0.s}}, p1/z, [{pa}]",
+        "add {t}, {pa}, #64",
+        "ld1w {{z1.s}}, p2/z, [{t}]",
+        "ld1sb {{z2.s}}, p3/z, [{pb}]",
+        "ld1sb {{z3.s}}, p4/z, [{pb}, #1, mul vl]",
+        "lsl z2.s, z2.s, #7",
+        "lsl z3.s, z3.s, #7",
+        "and z2.s, z2.s, #0xffffbfff",
+        "and z3.s, z3.s, #0xffffbfff",
+        "fcvt z2.s, p0/m, z2.h",
+        "fcvt z3.s, p0/m, z3.h",
+        "fmopa za0.s, p0/m, p0/m, z0.s, z2.s",
+        "fmopa za1.s, p0/m, p0/m, z0.s, z3.s",
+        "fmopa za2.s, p0/m, p0/m, z1.s, z2.s",
+        "fmopa za3.s, p0/m, p0/m, z1.s, z3.s",
+        "add {pa}, {pa}, {astr}",
+        "add {pb}, {pb}, {bstr}",
+        "subs {kk}, {kk}, #1",
+        "b.ne 27b",
         "25:",
         "cbnz {tr}, 40f",
         // row-major store: horizontal tile slices, row r of the strip to c + r * ldc
@@ -206,7 +262,7 @@ unsafe fn strip(
         "smstop",
         a = in(reg) a, astr = in(reg) astr, rows = in(reg) rows, b = inout(reg) b => _, bstr = in(reg) bstr,
         bjump = in(reg) bjump, ncols = in(reg) ncols, c = inout(reg) c => _, ldc = in(reg) ldc * 4, k = in(reg) k,
-        rows0 = in(reg) rows0, rows1 = in(reg) rows1, bf16 = in(reg) mode.bf16 as u64,
+        rows0 = in(reg) rows0, rows1 = in(reg) rows1, bk = in(reg) mode.b as u64,
         tr = in(reg) mode.transposed as u64,
         j = out(reg) _, t = out(reg) _, pa = out(reg) _, pb = out(reg) _, kk = out(reg) _, pc = out(reg) _,
         out("x12") _,
@@ -266,29 +322,31 @@ pub(crate) fn gemm_packed(m: usize, a: &[f32], lda: usize, w: &Packed, c: &mut [
     let (n, k) = (w.n, w.k);
     let panels = n.div_ceil(NRW);
     let groups = task_target(m, n, k, TASK_FLOPS).div_ceil(m.div_ceil(32)).clamp(1, panels);
-    let (ap, wp, cp) =
-        (SendPtr(a.as_ptr() as *mut f32), SendPtr(w.data().as_ptr() as *mut u16), SendPtr(c.as_mut_ptr()));
+    let (ap, cp) = (SendPtr(a.as_ptr() as *mut f32), SendPtr(c.as_mut_ptr()));
     Split::new(m, n, NRW, 32, panels.div_ceil(groups)).run(|t| {
-        let (ap, wp, cp) = (ap, wp, cp);
+        let (ap, cp) = (ap, cp);
         let mut buf = STRIP.take();
         buf.resize(k * 32, 0.0);
         // SAFETY: gemm_packed (simd) checked the bounds of A and C; tasks write disjoint (strip, column range)
         // regions of C.
         unsafe {
             transpose(ap.0.add(t.i0 * lda), lda, t.rows, k, buf.as_mut_ptr(), 32);
-            strip(
-                k,
-                buf.as_ptr(),
-                128,
-                t.rows,
-                wp.0.add(t.p0 * k * NRW) as *const u8,
-                64,
-                k * NRW * 2,
-                t.ncols,
-                cp.0.add(t.i0 * ldc + t.j0),
-                ldc,
-                Mode { bf16: true, transposed: false },
-            )
+            let cb = cp.0.add(t.i0 * ldc + t.j0);
+            match w.format() {
+                Weights::Bf16 => {
+                    let wb = w.bf16().as_ptr().add(t.p0 * k * NRW) as *const u8;
+                    let mode = Mode { b: B::Bf16, transposed: false };
+                    strip(k, buf.as_ptr(), 128, t.rows, wb, 64, k * NRW * 2, t.ncols, cb, ldc, mode)
+                }
+                // 8-bit weights widen in the kernel, then the task's columns are scaled
+                format => {
+                    let (b, factor) = if format == Weights::Int8 { (B::Int8, 1.0) } else { (B::E4m3, 256.0) };
+                    let wb = w.codes().as_ptr().add(t.p0 * k * NRW);
+                    let mode = Mode { b, transposed: false };
+                    strip(k, buf.as_ptr(), 128, t.rows, wb, 32, k * NRW, t.ncols, cb, ldc, mode);
+                    w.scale_task(t, cb, ldc, factor)
+                }
+            }
         }
         STRIP.set(buf);
     });
@@ -343,7 +401,7 @@ pub(crate) fn attention(qkv: &[f32], ld: usize, t: usize, nh: usize, hd: usize, 
                 t,
                 s.as_mut_ptr(),
                 32,
-                Mode { bf16: false, transposed: true },
+                Mode { b: B::F32, transposed: true },
             );
             let sums = softmax_cols(&mut s[..t * 32]);
             let dst = op.0.add(q0 * d + h * hd);
@@ -358,7 +416,7 @@ pub(crate) fn attention(qkv: &[f32], ld: usize, t: usize, nh: usize, hd: usize, 
                 hd,
                 dst,
                 d,
-                Mode { bf16: false, transposed: false },
+                Mode { b: B::F32, transposed: false },
             );
             for (r, sum) in sums.iter().enumerate().take(rows) {
                 let inv = 1.0 / sum;
@@ -430,7 +488,7 @@ mod speed {
                     t,
                     s.as_mut_ptr(),
                     32,
-                    Mode { bf16: false, transposed: true },
+                    Mode { b: B::F32, transposed: true },
                 );
                 let b = Instant::now();
                 let sums = softmax_cols(&mut s);
@@ -446,7 +504,7 @@ mod speed {
                     hd,
                     out.as_mut_ptr().add(q0 * d + h * hd),
                     d,
-                    Mode { bf16: false, transposed: false },
+                    Mode { b: B::F32, transposed: false },
                 );
                 let e = Instant::now();
                 std::hint::black_box(sums);

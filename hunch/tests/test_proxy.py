@@ -506,6 +506,19 @@ def test_labelled_examples_are_capped_per_class(db):
     assert sorted(np.bincount(ex.y).tolist()) == [10, 10]
 
 
+def test_the_fingerprint_names_8_bit_weights(monkeypatch):
+    from hunch.proxy import encoder_fingerprint
+
+    monkeypatch.delenv("EG2_BF16", raising=False)
+    monkeypatch.delenv("EG2_WEIGHTS", raising=False)
+    assert encoder_fingerprint(FakeModel(), 8)["precision"] == "fp32"  # as stores already record it
+    monkeypatch.setenv("EG2_WEIGHTS", "int8")
+    assert encoder_fingerprint(FakeModel(), 8)["precision"] == "fp32+int8"
+    monkeypatch.setenv("EG2_BF16", "bfmmla")
+    monkeypatch.setenv("EG2_WEIGHTS", "fp8")
+    assert encoder_fingerprint(FakeModel(), 8)["precision"] == "bf16:bfmmla+fp8"
+
+
 def test_features_are_tied_to_the_encoder(db):
     rng = random.Random(9)
     cases = [{"state": unit(rng, i % 2), "answer": bool(i % 2)} for i in range(80)]

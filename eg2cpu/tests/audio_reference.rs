@@ -64,9 +64,14 @@ fn matches_pytorch_audio_reference() {
             "{file:<26} x{repeat} {frames:>5} frames {n:>4} soft  mel |d| {mel_diff:.1e}  soft rel {soft_err:.1e}  \
              layers rel {worst_layer:.1e}  cos {cos:.7}  sims |d| {sim_err:.1e}"
         );
-        // bf16 matmuls (EG2_BF16) round the activations through both towers, so they get a looser bar.
-        let exact = eg2cpu::bf16_mode() == eg2cpu::Bf16::Off;
-        let (min_cos, max_drift) = if exact { (0.99999, 1e-3) } else { (0.9995, 2e-2) };
+        // bf16 matmuls (EG2_BF16) round the activations through both towers, so they get a looser bar, and 8-bit
+        // weights (EG2_WEIGHTS) looser ones still: int8 gives a cosine of about 0.9996 or better, fp8 0.9986.
+        let (min_cos, max_drift) = match (eg2cpu::weights_mode(), eg2cpu::bf16_mode()) {
+            (eg2cpu::Weights::Int8, _) => (0.999, 6e-2),
+            (eg2cpu::Weights::Fp8, _) => (0.997, 1.2e-1),
+            (_, eg2cpu::Bf16::Off) => (0.99999, 1e-3),
+            _ => (0.9995, 2e-2),
+        };
         assert!(cos > min_cos, "{file}: embedding cosine {cos}");
         assert!(soft_err < max_drift && worst_layer < max_drift, "{file}: drift {soft_err} {worst_layer}");
         let argmax = |x: &[f32]| (0..x.len()).max_by(|&a, &b| x[a].total_cmp(&x[b])).unwrap();

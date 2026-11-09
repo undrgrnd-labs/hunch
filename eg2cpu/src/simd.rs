@@ -459,6 +459,75 @@ pub fn bf16_mode() -> Bf16 {
     })
 }
 
+// ---------------------------------------------------------------- 8-bit weights
+
+/// How `Packed` stores weights, `EG2_WEIGHTS`: the checkpoint's bf16 (`bf16`, the default), or 8-bit codes with one
+/// f32 scale per output column, half the memory: `int8` (scale: the column's largest magnitude over 127, codes
+/// rounded to the nearest, ties to even) or `fp8` (e4m3, scale: the largest magnitude over 448, codes the nearest
+/// finite e4m3, the smaller on a tie). These are the codes and scales of the browser engine's `convert.py`. The
+/// matmuls decode a panel at a time to bf16, exactly (every int8 and e4m3 value is a bf16 value), and scale their
+/// output columns, so every kernel runs as it does on bf16 weights. Any other value gives bf16.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Weights {
+    Bf16,
+    Int8,
+    Fp8,
+}
+
+pub fn weights_mode() -> Weights {
+    static MODE: OnceLock<Weights> = OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("EG2_WEIGHTS").as_deref() {
+        Ok("int8") => Weights::Int8,
+        Ok("fp8") => Weights::Fp8,
+        _ => Weights::Bf16,
+    })
+}
+
+/// The value of e4m3 code `c` without its sign bit (0x7f, NaN, is never produced).
+fn e4m3_value(c: u8) -> f32 {
+    let (e, m) = ((c >> 3) & 15, (c & 7) as f32 / 8.0);
+    if e == 0 { m * 2f32.powi(-6) } else { (1.0 + m) * 2f32.powi(e as i32 - 7) }
+}
+
+/// The 8-bit code of `x` at column scale `scale`.
+fn quantize(format: Weights, x: f32, scale: f32) -> u8 {
+    let y = x / scale;
+    if format == Weights::Int8 {
+        return y.round_ties_even().clamp(-127.0, 127.0) as i8 as u8;
+    }
+    // The finite non-negative codes 0..=126 increase with their value.
+    static VALUES: OnceLock<[f32; 127]> = OnceLock::new();
+    let v = VALUES.get_or_init(|| std::array::from_fn(|c| e4m3_value(c as u8)));
+    let a = y.abs();
+    let i = v.partition_point(|&x| x < a).clamp(1, 126);
+    let code = if (v[i - 1] - a).abs() <= (v[i] - a).abs() { i - 1 } else { i };
+    code as u8 | if x < 0.0 { 0x80 } else { 0 }
+}
+
+#[inline(always)]
+fn int8_to_bf16(c: u8) -> u16 {
+    ((c as i8 as f32).to_bits() >> 16) as u16
+}
+
+#[inline(always)]
+fn e4m3_to_bf16(c: u8) -> u16 {
+    let (sign, em) = ((c as u16 & 0x80) << 8, c as u16 & 0x7f);
+    if em < 8 {
+        sign | ((em as f32 / 512.0).to_bits() >> 16) as u16 // subnormal: m * 2^-9
+    } else {
+        sign | (em + (120 << 3)) << 4 // exponent rebiased from 7 to 127, mantissa's 3 bits on top
+    }
+}
+
+/// bf16 values of the 8-bit codes `src`.
+fn decode(format: Weights, src: &[u8], dst: &mut [u16]) {
+    if format == Weights::Int8 {
+        dst.iter_mut().zip(src).for_each(|(d, &c)| *d = int8_to_bf16(c));
+    } else {
+        dst.iter_mut().zip(src).for_each(|(d, &c)| *d = e4m3_to_bf16(c));
+    }
+}
+
 /// bf16 x bf16 products with fp32 accumulation (AVX-512 BF16 `vdpbf16ps`), against weights packed in k pairs.
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod bf16dot {
@@ -1184,12 +1253,20 @@ macro_rules! isa_const {
 /// - `Sme`: as `Rows`, `nrw` = 32 (`sme::NRW`).
 /// - `Pairs`: k in pairs, padded to a multiple of 32; `nrw` = 32 (`bf16dot::NRW`).
 /// - `Quads`: k in groups of four, padded to a multiple of 4; `nrw` = 8 (`bfmmla::NRW`).
+///
+/// With 8-bit weights (`weights_mode`), panels hold codes in the same layout, and each column has a scale.
 pub(crate) struct Packed {
     pub n: usize,
     pub k: usize,
     nrw: usize,
     layout: Layout,
+    format: Weights,
+    /// bf16 weights, or empty.
     data: Vec<u16>,
+    /// 8-bit codes, or empty.
+    codes: Vec<u8>,
+    /// One per output column with 8-bit codes.
+    scales: Vec<f32>,
 }
 
 /// The widest panel of any layout: bounds the stack buffers that hold a partial panel row.
@@ -1237,9 +1314,11 @@ impl Layout {
 
 /// Pack `n` output columns over `k`, value `at(c, kk)` for column `c` and k index `kk`, into panels of `nrw` columns
 /// in `layout`, zero-padded, one panel per task.
-fn pack_panels(n: usize, k: usize, nrw: usize, layout: Layout, at: impl Fn(usize, usize) -> u16 + Sync) -> Vec<u16> {
+fn pack_panels<T: Copy + Default + Send + Sync>(
+    n: usize, k: usize, nrw: usize, layout: Layout, at: impl Fn(usize, usize) -> T + Sync,
+) -> Vec<T> {
     let plen = layout.kpad(k) * nrw;
-    let mut data = vec![0u16; n.div_ceil(nrw) * plen];
+    let mut data = vec![T::default(); n.div_ceil(nrw) * plen];
     data.par_chunks_mut(plen).enumerate().for_each(|(p, dst)| {
         for c in 0..nrw.min(n - p * nrw) {
             for kk in 0..k {
@@ -1253,18 +1332,23 @@ fn pack_panels(n: usize, k: usize, nrw: usize, layout: Layout, at: impl Fn(usize
 impl Packed {
     #[cfg(test)]
     pub fn new(w: &[u16], n: usize, k: usize) -> Self {
+        Self::with_format(w, n, k, weights_mode())
+    }
+
+    #[cfg(test)]
+    pub fn with_format(w: &[u16], n: usize, k: usize, format: Weights) -> Self {
         assert_eq!(w.len(), n * k);
-        Self::pack(n, k, |i| w[i])
+        Self::pack(n, k, format, |i| w[i])
     }
 
     /// Pack row-major little-endian bf16 bytes (e.g. a slice of a memory-mapped checkpoint) without an
     /// intermediate copy.
     pub fn from_le_bytes(b: &[u8], n: usize, k: usize) -> Self {
         assert_eq!(b.len(), 2 * n * k);
-        Self::pack(n, k, |i| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]))
+        Self::pack(n, k, weights_mode(), |i| u16::from_le_bytes([b[2 * i], b[2 * i + 1]]))
     }
 
-    fn pack(n: usize, k: usize, at: impl Fn(usize) -> u16 + Sync) -> Self {
+    fn pack(n: usize, k: usize, format: Weights, at: impl Fn(usize) -> u16 + Sync) -> Self {
         #[cfg(target_arch = "x86_64")]
         let (layout, nrw) =
             if bf16_mode() != Bf16::Off { (Layout::Pairs, bf16dot::NRW) } else { (Layout::Rows, isa_const!(NRW)) };
@@ -1279,13 +1363,83 @@ impl Packed {
         #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
         let (layout, nrw) = (Layout::Rows, isa_const!(NRW));
         assert!(nrw <= MAX_PANEL);
-        let data = pack_panels(n, k, nrw, layout, |c, kk| at(c * k + kk));
-        Self { n, k, nrw, layout, data }
+        if format == Weights::Bf16 {
+            let data = pack_panels(n, k, nrw, layout, |c, kk| at(c * k + kk));
+            return Self { n, k, nrw, layout, format, data, codes: vec![], scales: vec![] };
+        }
+        let qmax = if format == Weights::Int8 { 127.0 } else { 448.0 };
+        let scales: Vec<f32> = (0..n)
+            .into_par_iter()
+            .map(|c| {
+                let top = (0..k).map(|kk| bf16_to_f32(at(c * k + kk)).abs()).fold(0.0, f32::max);
+                if top > 0.0 { top / qmax } else { 1.0 }
+            })
+            .collect();
+        let codes = pack_panels(n, k, nrw, layout, |c, kk| quantize(format, bf16_to_f32(at(c * k + kk)), scales[c]));
+        Self { n, k, nrw, layout, format, data: vec![], codes, scales }
+    }
+
+    /// Run a kernel over task `t`'s panels as bf16. `f(w, np, j, ncols)` writes (does not accumulate) C's columns
+    /// `j..j + ncols` of the task's from the `np` panels at `w`. bf16 weights take one call. 8-bit ones are decoded
+    /// into a per-thread buffer about `DECODED` bytes at a time (at least a panel), a call for each, and then the
+    /// task's region of C is scaled by column. Fewer, larger calls matter to the SME kernel, which enters and leaves
+    /// streaming mode on every call.
+    ///
+    /// # Safety
+    /// `c`, C at (t.i0, t.j0), must be valid for `t.rows` rows `ldc` apart of `t.ncols` columns, which only this task
+    /// writes.
+    pub(crate) unsafe fn run_panels(
+        &self, t: Task, c: *mut f32, ldc: usize, f: impl Fn(*const u16, usize, usize, usize),
+    ) {
+        use std::cell::RefCell;
+        thread_local!(static PANEL: RefCell<Vec<u16>> = const { RefCell::new(Vec::new()) });
+        let plen = self.layout.kpad(self.k) * self.nrw;
+        if self.format == Weights::Bf16 {
+            return f(self.data.as_ptr().add(t.p0 * plen), t.np, 0, t.ncols);
+        }
+        /// bf16 bytes decoded per kernel call: a few panels, which stay in L2 between decoding and the kernel.
+        const DECODED: usize = 256 << 10;
+        let chunk = (DECODED / (2 * plen)).clamp(1, t.np);
+        let mut buf = PANEL.take();
+        buf.resize(chunk * plen, 0);
+        for p in (0..t.np).step_by(chunk) {
+            let np = chunk.min(t.np - p);
+            let src = &self.codes[(t.p0 + p) * plen..][..np * plen];
+            decode(self.format, src, &mut buf[..np * plen]);
+            let j = p * self.nrw;
+            f(buf.as_ptr(), np, j, (t.ncols - j).min(np * self.nrw));
+        }
+        PANEL.set(buf);
+        self.scale_task(t, c, ldc, 1.0)
+    }
+
+    /// Multiply task `t`'s region of C (at `c`, as `run_panels` takes it) by its columns' scales times `factor`.
+    ///
+    /// # Safety
+    /// As `run_panels`.
+    pub(crate) unsafe fn scale_task(&self, t: Task, c: *mut f32, ldc: usize, factor: f32) {
+        let scales: Vec<f32> = self.scales[t.j0..t.j0 + t.ncols].iter().map(|s| s * factor).collect();
+        for r in 0..t.rows {
+            let row = std::slice::from_raw_parts_mut(c.add(r * ldc), t.ncols);
+            row.iter_mut().zip(&scales).for_each(|(x, s)| *x *= s);
+        }
     }
 
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
-    pub(crate) fn data(&self) -> &[u16] {
+    pub(crate) fn format(&self) -> Weights {
+        self.format
+    }
+
+    /// The bf16 weights (empty with 8-bit weights).
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) fn bf16(&self) -> &[u16] {
         &self.data
+    }
+
+    /// The 8-bit codes (empty with bf16 weights).
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) fn codes(&self) -> &[u8] {
+        &self.codes
     }
 }
 
@@ -1399,14 +1553,16 @@ pub(crate) fn gemm_packed(m: usize, a: &[f32], lda: usize, w: &Packed, c: &mut [
         return gemm_quads(m, a, lda, w, c, ldc);
     }
     let pmr: usize = isa_const!(PMR);
-    let (ap, wp, cp) = (SendPtr(a.as_ptr() as *mut f32), SendPtr(w.data.as_ptr() as *mut u16), SendPtr(c.as_mut_ptr()));
+    let (ap, cp) = (SendPtr(a.as_ptr() as *mut f32), SendPtr(c.as_mut_ptr()));
     Split::balanced(m, n, k, nrw, pmr * 8).run(|t| {
-        let (ap, wp, cp) = (ap, wp, cp);
+        let (ap, cp) = (ap, cp);
         // SAFETY: bounds checked above; tasks write disjoint (row block, column range) regions of C.
-        let (a, w, c) = unsafe {
-            (ap.0.add(t.i0 * lda) as *const f32, wp.0.add(t.p0 * k * nrw) as *const u16, cp.0.add(t.i0 * ldc + t.j0))
+        let (a, c) = unsafe { (ap.0.add(t.i0 * lda) as *const f32, cp.0.add(t.i0 * ldc + t.j0)) };
+        let kernel = |wb: *const u16, np: usize, j: usize, nc: usize| {
+            dispatch!(gemm_packed_block(t.rows, k, a, lda, wb, np, nc, c.add(j), ldc))
         };
-        dispatch!(gemm_packed_block(t.rows, k, a, lda, w, t.np, t.ncols, c, ldc))
+        // SAFETY: as above.
+        unsafe { w.run_panels(t, c, ldc, kernel) }
     });
 }
 
@@ -1428,19 +1584,20 @@ fn gemm_pairs(m: usize, a: &[f32], lda: usize, w: &Packed, c: &mut [f32], ldc: u
                 bf16dot::round_rows(m, k, a.as_ptr(), lda, a16.as_mut_ptr(), kp)
             }
         };
-        let (ap, wp, cp) =
-            (SendPtr(a16.as_ptr() as *mut u16), SendPtr(w.data.as_ptr() as *mut u16), SendPtr(c.as_mut_ptr()));
+        let (ap, cp) = (SendPtr(a16.as_ptr() as *mut u16), SendPtr(c.as_mut_ptr()));
         split.run(|t| {
-            let (ap, wp, cp) = (ap, wp, cp);
+            let (ap, cp) = (ap, cp);
             // SAFETY: tasks write disjoint (row block, column range) regions of C; the CPU (and, for AMX, the OS)
             // support was checked by `bf16_mode`.
             unsafe {
-                let (ab, wb, cb) = (ap.0.add(t.i0 * kp), wp.0.add(t.p0 * kp * nrw), cp.0.add(t.i0 * ldc + t.j0));
-                if amx {
-                    amx::gemm_block(t.rows, kp, ab, kp, true, wb, kp * nrw, t.np, t.ncols, cb, ldc)
-                } else {
-                    bf16dot::gemm_block(t.rows, kp, ab, kp, wb, t.np, t.ncols, cb, ldc)
-                }
+                let (ab, cb) = (ap.0.add(t.i0 * kp) as *const u16, cp.0.add(t.i0 * ldc + t.j0));
+                w.run_panels(t, cb, ldc, |wb, np, j, nc| {
+                    if amx {
+                        amx::gemm_block(t.rows, kp, ab, kp, true, wb, kp * nrw, np, nc, cb.add(j), ldc)
+                    } else {
+                        bf16dot::gemm_block(t.rows, kp, ab, kp, wb, np, nc, cb.add(j), ldc)
+                    }
+                })
             }
         });
     });
@@ -1472,14 +1629,15 @@ fn gemm_quads(m: usize, a: &[f32], lda: usize, w: &Packed, c: &mut [f32], ldc: u
         } else {
             a16.par_chunks_mut(tile).with_min_len((1 << 14) / tile + 1).enumerate().for_each(round);
         }
-        let (ap, wp, cp) =
-            (SendPtr(a16.as_ptr() as *mut u16), SendPtr(w.data.as_ptr() as *mut u16), SendPtr(c.as_mut_ptr()));
+        let (ap, cp) = (SendPtr(a16.as_ptr() as *mut u16), SendPtr(c.as_mut_ptr()));
         split.run(|t| {
-            let (ap, wp, cp) = (ap, wp, cp);
+            let (ap, cp) = (ap, cp);
             // SAFETY: tasks write disjoint (row block, column range) regions of C; `bf16_mode` checked the CPU has BF16.
             unsafe {
-                let (ab, wb, cb) = (ap.0.add(t.i0 * kq), wp.0.add(t.p0 * kq * nrw), cp.0.add(t.i0 * ldc + t.j0));
-                bfmmla::gemm_block(t.rows, kq, ab, wb, kq * nrw, t.np, t.ncols, cb, ldc)
+                let (ab, cb) = (ap.0.add(t.i0 * kq) as *const u16, cp.0.add(t.i0 * ldc + t.j0));
+                w.run_panels(t, cb, ldc, |wb, np, j, nc| {
+                    bfmmla::gemm_block(t.rows, kq, ab, wb, kq * nrw, np, nc, cb.add(j), ldc)
+                })
             }
         });
     });
@@ -1566,9 +1724,69 @@ mod tests {
             let ar: Vec<f32> = if bf16 { a.iter().map(|&x| bf16_to_f32(f32_to_bf16(x))).collect() } else { a.clone() };
             let want = naive(m, n, k, &ar, &bt);
             let mut c = vec![0.0; m * n];
-            gemm_packed(m, &a, k, &Packed::new(&bb, n, k), &mut c, n);
+            gemm_packed(m, &a, k, &Packed::with_format(&bb, n, k, Weights::Bf16), &mut c, n);
             let err = c.iter().zip(&want).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
             assert!(err < 1e-4, "{:?} {m}x{n}x{k}: {err}", bf16_mode());
+        }
+    }
+
+    #[test]
+    fn eight_bit_codes_follow_convert_py() {
+        for c in 0..=255u8 {
+            let want = c as i8 as f32;
+            assert_eq!(bf16_to_f32(int8_to_bf16(c)), want);
+            if c & 0x7f == 0x7f {
+                continue; // NaN, never produced
+            }
+            let want = if c & 0x80 != 0 { -e4m3_value(c & 0x7f) } else { e4m3_value(c) };
+            assert_eq!(bf16_to_f32(e4m3_to_bf16(c)), want, "e4m3 {c:#04x}");
+            if c < 0x7f {
+                assert_eq!(quantize(Weights::Fp8, e4m3_value(c), 1.0), c); // every finite code round-trips
+            }
+        }
+        // int8: nearest, ties to even, clamped to +-127
+        let q8 = |x: f32| quantize(Weights::Int8, x, 1.0) as i8;
+        assert_eq!(
+            [q8(0.5), q8(1.5), q8(2.5), q8(-2.5), q8(126.6), q8(300.0), q8(-300.0)],
+            [0, 2, 2, -2, 127, 127, -127]
+        );
+        // e4m3: nearest, the smaller code on a tie, at most 448
+        let q = |x: f32| quantize(Weights::Fp8, x, 1.0);
+        assert_eq!(e4m3_value(0x38), 1.0);
+        assert_eq!([q(1.0), q(-1.0), q(1.0625), q(1.07), q(448.0), q(1000.0)], [0x38, 0xb8, 0x38, 0x39, 0x7e, 0x7e]);
+        assert_eq!(q(2f32.powi(-10)), 0); // halfway to the smallest subnormal, 2^-9
+    }
+
+    #[test]
+    fn packed_eight_bit_matches_dequantized() {
+        for format in [Weights::Int8, Weights::Fp8] {
+            for &(m, n, k) in &[(1, 1, 1), (5, 7, 13), (33, 70, 100), (67, 131, 257), (96, 512, 512), (130, 64, 2048)] {
+                let a = rnd(m * k, 5);
+                let mut b = rnd(n * k, 6);
+                b[..k].fill(0.0); // a zero column: scale 1, codes 0
+                let bb: Vec<u16> = b.iter().map(|&x| f32_to_bf16(x)).collect();
+                let qmax = if format == Weights::Int8 { 127.0 } else { 448.0 };
+                let deq: Vec<f32> = bb
+                    .chunks(k)
+                    .flat_map(|col| {
+                        let top = col.iter().map(|&x| bf16_to_f32(x).abs()).fold(0.0, f32::max);
+                        let scale = if top > 0.0 { top / qmax } else { 1.0 };
+                        col.iter().map(move |&x| {
+                            let code = quantize(format, bf16_to_f32(x), scale);
+                            let v = if format == Weights::Int8 { int8_to_bf16(code) } else { e4m3_to_bf16(code) };
+                            bf16_to_f32(v) as f64 as f32 * scale
+                        })
+                    })
+                    .collect();
+                let bf16 = bf16_mode() != Bf16::Off;
+                let ar: Vec<f32> =
+                    if bf16 { a.iter().map(|&x| bf16_to_f32(f32_to_bf16(x))).collect() } else { a.clone() };
+                let want = naive(m, n, k, &ar, &deq);
+                let mut c = vec![f32::NAN; m * n];
+                gemm_packed(m, &a, k, &Packed::with_format(&bb, n, k, format), &mut c, n);
+                let err = c.iter().zip(&want).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
+                assert!(err < 1e-4, "{format:?} {:?} {m}x{n}x{k}: {err}", bf16_mode());
+            }
         }
     }
 
@@ -1593,7 +1811,7 @@ mod tests {
                 continue; // the packed path rounds A too: `packed_matches_naive_in_its_precision` covers it
             }
             c.fill(f32::NAN);
-            gemm_packed(m, &a, k, &Packed::new(&bb, n, k), &mut c, n);
+            gemm_packed(m, &a, k, &Packed::with_format(&bb, n, k, Weights::Bf16), &mut c, n);
             let err = c.iter().zip(&want).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max);
             assert!(err < 1e-4, "packed {m}x{n}x{k}: {err}");
         }
