@@ -70,6 +70,7 @@ How it decides (docs/question-design.md says which questions it can take over):
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import io
 import json
@@ -80,6 +81,7 @@ import random
 import sys
 import threading
 import time
+import uuid
 from collections import OrderedDict, deque
 from concurrent.futures import Future
 from dataclasses import dataclass, field
@@ -92,6 +94,7 @@ import numpy as np
 from .store import LABELLED, SAMPLED, Examples, FingerprintMismatch, Row, Store, open_store
 
 QTYPES = ("noul", "choice", "score")
+EMBEDDING_MODEL = "google/embeddinggemma-2"  # the model name /v1/embeddings answers to
 CLIP_CHARS = 3000  # the encoder reads at most 1,024 tokens: longer states keep their head and tail (`encoder_text`)
 
 
@@ -660,6 +663,10 @@ class Student:
 # ---------------------------------------------------------------- backends
 
 
+class ModelNotFound(LookupError):
+    """An embeddings request for a model the proxy doesn't serve."""
+
+
 class BackendError(RuntimeError):
     """The teacher failed: unreachable, timed out, or answered without every question."""
 
@@ -752,7 +759,8 @@ def encoder_fingerprint(model, layer: int) -> dict:
 class Encoder:
     """Layer-`layer` features for state texts: a cache of `cache_size` states, and one thread that encodes whatever
     texts are waiting as one batch (up to `max_batch`), so concurrent requests share passes and the encoder never
-    runs several passes against each other. A text already being encoded is waited for, not encoded twice."""
+    runs several passes against each other. A text already being encoded is waited for, not encoded twice. Final
+    embeddings (`embed`) go through the same thread."""
 
     def __init__(self, model, layer: int, max_batch: int = 64, cache_size: int = 4096):
         self.model, self.layer, self.max_batch, self.cache_size = model, layer, max_batch, cache_size
@@ -787,15 +795,30 @@ class Encoder:
                     f = self._inflight[h] = Future()
                     self._queue.put((h, t, f))
                 waits[h] = f
-            if waits and self._thread is None:
-                self._thread = threading.Thread(target=self._run, name="hunch-encode", daemon=True)
-                self._thread.start()
+            if waits:
+                self._start_thread()
         return hashes, waits
 
     def finish(self, hashes: list[str], waits: dict[str, Future]) -> tuple[list[str], np.ndarray]:
         """(state hashes, float32 features) for what `start` queued."""
         got = {h: f.result() for h, f in waits.items()}
         return hashes, np.stack([got[h] for h in hashes])
+
+    def embed(self, texts: list[str]) -> np.ndarray:
+        """The final embeddings of the texts as given (not clipped: the model truncates at 1,024 tokens), float32
+        [len(texts), d] with unit norm. Not cached."""
+        futures = [Future() for _ in texts]
+        with self._lock:
+            for t, f in zip(texts, futures):
+                self._queue.put((None, t, f))
+            if futures:
+                self._start_thread()
+        return np.stack([f.result() for f in futures])
+
+    def _start_thread(self) -> None:  # with the lock held
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._run, name="hunch-encode", daemon=True)
+            self._thread.start()
 
     def _run(self) -> None:
         while True:
@@ -805,23 +828,36 @@ class Encoder:
                     batch.append(self._queue.get_nowait())
                 except queue.Empty:
                     break
-            try:
-                parts = self.model.embed_batch_partial([encoder_text(t) for _, t, _ in batch], self.layer)
-                vals = [np.asarray(p.layer_means[self.layer], dtype=np.float32) for p in parts]
-            except Exception as e:  # the waiting requests fail; the encoder keeps running
-                with self._lock:
-                    for h, _, f in batch:
-                        self._inflight.pop(h, None)
+            if feats := [b for b in batch if b[0] is not None]:
+                self._features(feats)
+            if full := [(t, f) for h, t, f in batch if h is None]:
+                try:
+                    vals = [np.asarray(e, dtype=np.float32) for e, _ in self.model.embed_batch([t for t, _ in full])]
+                except Exception as e:
+                    for _, f in full:
                         f.set_exception(e)
-                continue
+                    continue
+                for (_, f), v in zip(full, vals):
+                    f.set_result(v)
+
+    def _features(self, batch: list[tuple[str, str, Future]]) -> None:
+        try:
+            parts = self.model.embed_batch_partial([encoder_text(t) for _, t, _ in batch], self.layer)
+            vals = [np.asarray(p.layer_means[self.layer], dtype=np.float32) for p in parts]
+        except Exception as e:  # the waiting requests fail; the encoder keeps running
             with self._lock:
-                for (h, _, _), v in zip(batch, vals):
-                    self._cache[h] = v
+                for h, _, f in batch:
                     self._inflight.pop(h, None)
-                while len(self._cache) > self.cache_size:
-                    self._cache.popitem(last=False)
-            for (_, _, f), v in zip(batch, vals):
-                f.set_result(v)
+                    f.set_exception(e)
+            return
+        with self._lock:
+            for (h, _, _), v in zip(batch, vals):
+                self._cache[h] = v
+                self._inflight.pop(h, None)
+            while len(self._cache) > self.cache_size:
+                self._cache.popitem(last=False)
+        for (_, _, f), v in zip(batch, vals):
+            f.set_result(v)
 
 
 # ---------------------------------------------------------------- the proxy
@@ -866,7 +902,7 @@ class Proxy:
         self.lock = threading.RLock()  # the students table and the stats
         self.students: dict[str, Student] = {}
         self.stats = {"requests": 0, "local": 0, "cached": 0, "forwarded": 0, "audited": 0, "audits_skipped": 0,
-                      "label_asks": 0, "backend_errors": 0}
+                      "label_asks": 0, "backend_errors": 0, "embedded": 0}
         self._latency: deque[tuple[str, float]] = deque(maxlen=2000)
         self.background = background
         self._pending: dict[str, None] = {}  # versions waiting for a refit, in order
@@ -951,6 +987,41 @@ class Proxy:
     def features(self, texts: list[str]) -> tuple[list[str], np.ndarray]:
         """(state hashes, layer-`layer` means as float32), through the encoder's cache and batching thread."""
         return self.encoder(texts)
+
+    def embeddings(self, request: dict) -> dict:
+        """An embeddings request and response in the OpenAI shape that vLLM serves. The request: "input" (a string or
+        a list of strings), "model" (optional; EMBEDDING_MODEL), "encoding_format" ("float", the default, or "base64":
+        little-endian float32) and "dimensions" (optional; only the model's own, since the checkpoint declares no
+        Matryoshka sizes). Other fields are ignored. Each input gets the model's final embedding (unit norm), not the
+        layer features the students read; inputs over 1,024 tokens are truncated, and "usage" counts the tokens read,
+        <bos> and <eos> included."""
+        model = request.get("model")
+        if model is not None and model != EMBEDDING_MODEL:
+            raise ModelNotFound(f"The model `{model}` does not exist.")
+        inp = request.get("input")
+        texts = [inp] if isinstance(inp, str) else inp
+        if not isinstance(texts, list) or not texts:
+            raise ValueError("input must be a string or a non-empty list of strings")
+        if not all(isinstance(t, str) for t in texts):
+            raise ValueError("input must be text: token ids are not supported")
+        fmt = request.get("encoding_format") or "float"
+        if fmt not in ("float", "base64"):
+            raise ValueError(f"encoding_format must be 'float' or 'base64', not {fmt!r}")
+        dims = request.get("dimensions")
+        if dims is not None and (isinstance(dims, bool) or not isinstance(dims, int)):
+            raise ValueError("dimensions must be an integer")
+        E = self.encoder.embed(texts)
+        if dims is not None and dims != E.shape[1]:
+            raise ValueError(f"{EMBEDDING_MODEL} has no Matryoshka sizes: dimensions must be {E.shape[1]} or left out")
+        tokens = sum(len(self.model.tokenize(t)) for t in texts)
+        with self.lock:
+            self.stats["embedded"] += len(texts)
+        data = [{"index": i, "object": "embedding",
+                 "embedding": base64.b64encode(v.astype("<f4").tobytes()).decode() if fmt == "base64" else v.tolist()}
+                for i, v in enumerate(E)]
+        return {"id": f"embd-{uuid.uuid4().hex}", "object": "list", "created": int(time.time()),
+                "model": EMBEDDING_MODEL, "data": data,
+                "usage": {"prompt_tokens": tokens, "total_tokens": tokens, "completion_tokens": 0}}
 
     def blind_spots(self, question: dict | str, **kw) -> dict:
         """Where the teacher disagrees with the labels for one question version (a question or its key): see
@@ -1297,7 +1368,7 @@ def make_handler(proxy: Proxy, token: str | None = None, train_token: str | None
                  access_log: bool = False, timeout: float | None = 30):
     import hmac
     import traceback
-    import uuid
+    from http import HTTPStatus
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"  # keep-alive; every response carries Content-Length
@@ -1307,6 +1378,10 @@ def make_handler(proxy: Proxy, token: str | None = None, train_token: str | None
             super().setup()
 
         def _send(self, code: int, body: dict) -> None:
+            if self.path == "/v1/embeddings" and code >= 400:  # OpenAI's error shape, as vLLM sends it
+                error = {"message": body.pop("error"), "type": HTTPStatus(code).phrase.replace(" ", "") + "Error",
+                         "param": None, "code": code}
+                body = {"error": error} | body
             data = json.dumps(body).encode()
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
@@ -1357,7 +1432,7 @@ def make_handler(proxy: Proxy, token: str | None = None, train_token: str | None
 
         def do_POST(self):
             self._t0 = time.perf_counter()
-            if self.path not in ("/v1/answer", "/v1/train"):
+            if self.path not in ("/v1/answer", "/v1/train", "/v1/embeddings"):
                 return self._refuse(404, "not found")
             if not self._authorized(train_token or token if self.path == "/v1/train" else token):
                 self.close_connection = True
@@ -1384,11 +1459,15 @@ def make_handler(proxy: Proxy, token: str | None = None, train_token: str | None
                     raise ValueError("the request body must be a JSON object")
                 if self.path == "/v1/answer":
                     return self._send(200, proxy.answer(body))
+                if self.path == "/v1/embeddings":
+                    return self._send(200, proxy.embeddings(body))
                 if "question" not in body:
                     raise ValueError("a train request needs a question")
                 return self._send(200, proxy.train(body["question"], body.get("cases", []), body.get("refit", True)))
             except BackendError as e:
                 self._send(502, {"error": str(e)})
+            except ModelNotFound as e:
+                self._send(404, {"error": str(e)})
             except (ValueError, KeyError, TypeError) as e:
                 self._send(400, {"error": f"{type(e).__name__}: {e}"})
             except Exception:  # the detail goes to the log, which the client can quote by its id
@@ -1438,6 +1517,8 @@ def serve(proxy: Proxy, host: str = "127.0.0.1", port: int = 8765, *, token: str
     """Endpoints (HTTP/1.1, keep-alive):
       POST /v1/answer     a request; answered from the store, locally or by the teacher ("answered_by" says which)
       POST /v1/train      {"question": {...}, "cases": [{"state", "answer", "kind": "labelled"|"sampled"}], "refit": true}
+      POST /v1/embeddings {"input": "text" | ["text", ...]}: the model's embeddings, as vLLM and OpenAI serve them
+                          (`Proxy.embeddings`); its errors come as {"error": {"message", "type", "param", "code"}}
       GET  /v1/questions  {"ready", "stats", "latency", "layer", "encoder", "states", "questions": [...]}: request
                           counts, latency by who answered, the encoder fingerprint, the stored states, and every
                           question's examples, graduation, CV report and audits

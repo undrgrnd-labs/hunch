@@ -207,6 +207,7 @@ ground truth across rewordings, name the question's family:
 |---|---|
 | `POST /v1/answer` | a request (above) |
 | `POST /v1/train` | training cases (above) |
+| `POST /v1/embeddings` | EmbeddingGemma 2 embeddings, as vLLM and OpenAI serve them (below) |
 | `GET /v1/questions` | `{"ready", "stats", "latency", "layer", "encoder", "states", "questions": [...]}`: request counts, latency by who answered, and each question's examples, graduation, cross-validation report and audits |
 | `GET /healthz` | 200 while the process is up |
 | `GET /readyz` | 200 once every question restored from the store has a fit, else 503 |
@@ -221,6 +222,28 @@ ground truth across rewordings, name the question's family:
 - **Errors:** an unexpected failure gets 500 with only an `error_id`; the detail is logged to stderr under that id.
 - **CPU:** `--threads` caps the threads the encoder uses (the default is every core).
 - **Logs:** `--access-log` writes one line per request to stderr: method, path, status, milliseconds, who answered.
+
+**Embeddings.** `/v1/embeddings` takes the request OpenAI's and vLLM's clients send, so they can use the proxy's
+encoder directly:
+
+```bash
+curl -s localhost:8765/v1/embeddings -d '{"model": "google/embeddinggemma-2", "input": ["bash: git status", "ls: config/: No such file"]}'
+# {"id": "embd-…", "object": "list", "created": …, "model": "google/embeddinggemma-2",
+#  "data": [{"index": 0, "object": "embedding", "embedding": [0.0123, …]}, …],
+#  "usage": {"prompt_tokens": 15, "total_tokens": 15, "completion_tokens": 0}}
+```
+
+- Each input gets the model's final embedding: 768 floats with unit norm. These are not the layer-8 features the
+  students read.
+- `input` is a string or a list of strings; token ids are refused. `model` may be left out, and any other name gets
+  404.
+- `encoding_format` is `float` or `base64` (little-endian float32).
+- `dimensions` may only be 768, since the checkpoint declares no Matryoshka sizes.
+- Inputs over 1,024 tokens are truncated, where vLLM would refuse them. `usage` counts the tokens read, `<bos>` and
+  `<eos>` included.
+- Embeddings run on the encoder's thread, batched with the states waiting to be encoded, and aren't cached.
+- Errors on this endpoint use OpenAI's shape: `{"error": {"message", "type", "param", "code"}}`.
+- `--max-body` limits how many inputs fit in one request.
 
 **Storage.** `--db` takes a SQLite path, or a Redis URL (`redis://host:port/db?prefix=name`, with
 `pip install hunch[redis]`). The store holds:
