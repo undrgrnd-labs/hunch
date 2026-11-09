@@ -42,7 +42,8 @@ A question with options looks like this:
 
 hunch sends a `POST` request to the teacher, `{"state": ..., "questions": {id: question}}`, and expects
 `{"answers": {id: answer}}` back, with an answer for every question:
-- `noul`: `{"type": "noul", "noul": 0.97}`, P(yes);
+- `noul`: `{"type": "noul", "noul": 0.97}`, P(yes). `noul` is read before any `probabilities`, which some teachers
+  also send, keyed `yes`/`no`;
 - `choice`: `{"type": "choice", "probabilities": {"test_run": 0.9, "build": 0.05, "other": 0.05}}`;
 - `score`: `{"type": "score", "probabilities": {"0": 0.1, "1": 0.7, "2": 0.2}}`, by level index.
 
